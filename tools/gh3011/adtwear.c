@@ -289,7 +289,17 @@ int main(int argc, char **argv)
         cmd(CMD_HALT);
         usleep(500);
         rd16(0x0008, &st);
-        if (rd16(0x00c0, &c0) == 0 && (st & ST_EVENT))
+        /* The interrupt is the event; the status bit is a bonus.
+         *
+         * Requiring bit 4 of 0x0008 here loses a race with the kernel's own handler, which reads
+         * and clears the status before this gets to it. It is set often enough to look required
+         * and absent often enough to throw away good answers: one run reported nothing while
+         * 0x00c0 sat there reading 0x0001 with bit 8 clear, on a wrist.
+         *
+         * Whether an event happened is already known - the wait returned - so the status is
+         * logged and not depended on.
+         */
+        if (rd16(0x00c0, &c0) == 0)
             worn = (c0 & C0_UNWORN) ? 0 : 1;
     }
 
