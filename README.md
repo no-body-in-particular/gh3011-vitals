@@ -19,7 +19,8 @@ else from here.
 
 No saturation percentage is published, deliberately. The ratio is real; turning it into a number
 out of ten requires a calibration this has no reference for, and a one-point anchor once printed
-86% for a healthy wearer at rest - alarming, and with no measurement behind it. See `docs/vitals.md`.
+86% for a healthy wearer at rest - alarming, and with no measurement behind it. `docs/gh3011.md`
+says what each number is worth.
 
 ## The interface
 
@@ -37,17 +38,16 @@ A refusal is a normal answer and says why. `weak=1` on a ratio means there was t
 behind it to divide by; `tracked=1` on a rate means the windows disagreed and the previous rate
 chose between them.
 
-Every measurement is appended to `/sdcard/vitals.log` with its full field set, which is what the
-analysis in `docs/` is built on.
+Every measurement is appended to `/sdcard/vitals.log` with its full field set.
 
 ## Layout
 
     tools/gh3011/vitalsd.c     the daemon: socket, wear check, two-pass measurement
     tools/gh3011/ppgd.c        the measurement itself, and everything that reads a waveform
-    tools/gh3011/*.c           probes, register dumps, sweeps, and the vendor-binary harnesses
-    docs/gh3011.md             the chip: registers, ioctls, and what the vendor's code does
-    docs/vitals.md             the measurements: what works, what does not, and why
-    docs/data/                 captures and cuff references the conclusions rest on
+    tools/gh3011/adtwear.c     the chip's own wear detector
+    tools/gh3011/seq.h         the start sequence, generated from a capture of the vendor daemon
+    tools/gh3011/adt_table.h   the auto-detect configuration, read out of the vendor binary
+    docs/gh3011.md             the chip: registers, commands, and how a reading is taken
 
 ## Building
 
@@ -55,13 +55,13 @@ An Android NDK arm32 toolchain, and nothing else:
 
     armv7a-linux-androideabi19-clang -Os -Wall -o ppgd ppgd.c -lm
     armv7a-linux-androideabi19-clang -Os -Wall -o vitalsd vitalsd.c
+    armv7a-linux-androideabi19-clang -Os -Wall -o adtwear adtwear.c
 
 `tools/gh3011/install-vitalsd.sh` puts them on the watch and takes over the init slot. It keeps
 the vendor daemon at `gh3011_service.real` so the swap is one `cat` in either direction.
 
-## A note on the notes
+## What is not here
 
-`docs/` records what was tried and did not work alongside what did, including several conclusions
-that were reached, written down, and later shown to be wrong. That is deliberate. Most of the time
-lost on this went into rediscovering dead ends, and a note saying "this was tried, here is the
-measurement, it does not work" is worth as much as one describing a success.
+The probes, register sweeps, vendor-binary harnesses and captures this was worked out with are
+not in this repository. `docs/gh3011.md` is the result of them and is the part worth keeping; the
+rest was scaffolding, and some of it recorded measurements of a person.
