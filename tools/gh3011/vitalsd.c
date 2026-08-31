@@ -37,6 +37,10 @@
 
 #define SOCKNAME "watchvitals"      /* abstract: android.net.LocalSocket, ABSTRACT namespace */
 #define HELPER   "/data/local/tmp/ppgd"
+
+/* The chip's own wear detector, run as a helper for the same reason ppgd is: it needs
+ * /dev/gh_tools to itself, and a daemon holding that open cannot also hand it to a measurement. */
+#define ADTHELPER "/data/local/tmp/adtwear"
 #define SECS_HR   "40"   /* green is 25 Hz: it needs the time to fill enough windows */
 #define SECS_SPO2 "45"   /* red is 100 Hz - 2500 samples in 25 s is plenty */
 /* The balanced pass. The vendor spends about eight seconds here and we did too, but eight is
@@ -71,6 +75,36 @@ static int slurp(const char *path, char *buf, size_t n)
     if (got <= 0) return -1;
     buf[got] = 0;
     return 0;
+}
+
+/* What the chip's own detector says: 1 on a wrist, 0 off it, -1 no answer.
+ *
+ * Not a second opinion on the thermometer so much as a differently shaped one. The thermometer
+ * reports a level and will always answer, given six seconds. This reports an event - bit 4 of
+ * 0x0008 - and answers immediately or not at all, because bit 8 of 0x00c0 only means anything
+ * when an event has set it. A watch that has been still on a wrist for an hour has generated no
+ * transition and gets -1, which is the honest answer to a question asked of an edge detector.
+ *
+ * Whether starting the detector makes it evaluate the current state, and so answer without
+ * waiting for the wearer to do anything, is the one thing this cannot be reasoned into: it is
+ * reported alongside the thermometer's answer on every wear request so the logs can settle it.
+ */
+static int adt_worn(int waitms)
+{
+    char cmd[128], line[128];
+    FILE *p;
+    int v = -1;
+
+    if (access(ADTHELPER, X_OK) != 0) return -1;
+    snprintf(cmd, sizeof cmd, "%s -q -w %d 2>/dev/null", ADTHELPER, waitms);
+    p = popen(cmd, "r");
+    if (!p) return -1;
+    while (fgets(line, sizeof line, p)) {
+        char *at = strstr(line, "worn=");
+        if (at) v = atoi(at + 5);
+    }
+    pclose(p);
+    return v;
 }
 
 /* Wrist temperature in hundredths of a degree, or -1 if the sensor will not say.
@@ -622,12 +656,26 @@ int main(void)
         if (strcmp(req, "wear") == 0) {
             /* Answerable without lighting an LED, so the launcher can skip a measurement it
              * already knows will fail. */
+            /* Both sources, and the thermometer decides.
+             *
+             * The chip's detector is the better instrument in principle - immediate, and
+             * measuring the thing itself rather than a temperature a radiator would also raise.
+             * It does not decide yet because it has not been shown to be right: three readings
+             * of its register were confidently wrong before its protocol was understood, and a
+             * wear check that wrongly says no suppresses every measurement behind it. It is
+             * reported so the logs can accumulate the agreement, and adt= becoming the decision
+             * is then a one-line change with evidence behind it rather than a hope.
+             */
             int wt = read_temp(8);
+            int adt = adt_worn(2000);
+            int at = 0;
+
             if (wt > 0)
-                snprintf(reply, sizeof reply, "worn=%d temp=%d.%02d\n",
-                         wt >= WORN_C ? 1 : 0, wt / 100, wt % 100);
+                at = snprintf(reply, sizeof reply, "worn=%d temp=%d.%02d",
+                              wt >= WORN_C ? 1 : 0, wt / 100, wt % 100);
             else
-                snprintf(reply, sizeof reply, "worn=-1 reason=no_thermometer\n");
+                at = snprintf(reply, sizeof reply, "worn=-1 reason=no_thermometer");
+            snprintf(reply + at, sizeof reply - at, " adt=%d\n", adt);
         } else {
             measure(req, reply, sizeof reply);
             logline(req, reply);
