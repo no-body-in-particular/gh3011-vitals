@@ -191,8 +191,16 @@ static void adt_stop(void)
  * it; wear detection wants no FIFO, only the fact that something happened, so the kernel draining
  * data we do not want costs nothing.
  *
- * In a child with an alarm because the wait blocks forever when the chip is not sampling - ten
+ * In a child with an alarm because the wait can block forever when the chip is not sampling - ten
  * minutes, on a powered sensor on a wrist, the time it was called directly.
+ *
+ * It does not work, and the failure is a quiet one. Once the chip is configured without breaking
+ * it, this returns success in about a second rather than waiting, and returns it just the same
+ * with the chip's own interrupt disabled - so the success means nothing happened rather than
+ * something did. Taken at face value it produced a wear reading that looked real and was 0x00c0's
+ * configured value with bit 8 clear, which is what that register reads in every state. Time the
+ * call before believing it: a wait that returns in a second out of a twenty second window did not
+ * wait for anything.
  */
 static int wait_irq(int fd, int secs)
 {
@@ -251,10 +259,19 @@ int main(int argc, char **argv)
             cmd(CMD_START);
         }
     } else if (wait_irq(fd, (waitms + 999) / 1000)) {
-        /* Halt before reading, the way their interrupt path does. */
-        cmd(CMD_HALT);
-        usleep(500);
-        rd16(0x0008, &st);
+        /* Halt before reading, the way their interrupt path does - unless we are trying to catch
+         * the status before anything clears it, in which case read it first and halt after. The
+         * status has read 0x0000 on every interrupt so far, so either the kernel's own handler
+         * takes it or the halt does, and this says which. */
+        if (getenv("NOHALT")) {
+            rd16(0x0008, &st);
+            cmd(CMD_HALT);
+            usleep(500);
+        } else {
+            cmd(CMD_HALT);
+            usleep(500);
+            rd16(0x0008, &st);
+        }
         if (rd16(0x00c0, &c0) == 0) worn = (c0 & C0_UNWORN) ? 0 : 1;
         got_irq = 1;
     }
