@@ -558,6 +558,56 @@ static void measure(const char *mode, char *out, size_t outsz)
                 pclose(p);
             }
         }
+
+        /* No rate of its own, but green found one: replay this capture at green's rate.
+         *
+         * The pressure only comes from the red pass, and the red pass is the one that most often
+         * cannot find a rate - red and infrared carry 1 to 80 counts of pulse where green carries
+         * 200 to 900, so the windows disagree and the whole pass is thrown away. The shape does
+         * not need the pass to have found the rate, only to be told one, and green measured a
+         * good one seconds earlier.
+         *
+         * So replay the samples we already have at that rate. No extra sensor time, and the
+         * alternative is what was happening before: a wearer with a perfectly good waveform on
+         * disk and no pressure published for hours.
+         *
+         * The rate is reported as the hint's, not as a measurement - hrfrom=hint says so, and the
+         * launcher overwrites it with green's own figure anyway. Without a rate in the line the
+         * reading is discarded before anything looks at the pressure.
+         */
+        if (bpm < 30 && strcmp(mode, "spo2") == 0 && wave_path[0]) {
+            int hint = last_rate();
+
+            if (hint >= 30 && hint <= 210) {
+                char scmd[320], line[512], shape[256];
+
+                shape[0] = 0;
+                snprintf(scmd, sizeof scmd, "%s 0 %s shape %d 2>/dev/null",
+                         HELPER, wave_path, hint);
+                p = popen(scmd, "r");
+                if (p) {
+                    while (fgets(line, sizeof line, p)) {
+                        const char *sb = strstr(line, "sbp=");
+                        const char *db = strstr(line, "dbp=");
+                        if (sb && db && atoi(sb + 4) > 0) {
+                            snprintf(shape, sizeof shape,
+                                     " hr=%d hrfrom=hint sbp=%d dbp=%d shape=replayed",
+                                     hint, atoi(sb + 4), atoi(db + 4));
+                        }
+                    }
+                    pclose(p);
+                }
+
+                /* Ahead of the existing text, because the launcher reads the first hr= it finds
+                 * and the line already carries hr=0. */
+                if (shape[0]) {
+                    char merged[512];
+                    snprintf(merged, sizeof merged, "%s %s", shape + 1, out);
+                    strncpy(out, merged, outsz - 1);
+                    out[outsz - 1] = 0;
+                }
+            }
+        }
     }
 
     /* Judge the pass, then fold it into the running view.
