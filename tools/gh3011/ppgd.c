@@ -50,6 +50,32 @@ struct rdwr { struct msg *msgs; int n; };
  */
 #define DARK_CODE 3145728.0
 
+/* 0x300000 is three units of 0x100000, and the count of units is a setting.
+ *
+ * The pedestal was measured once, in the configuration this file has always used, and written
+ * down as a constant. It is not one. Sweeping the high byte of 0x0080 moves it in exact multiples
+ * of 0x100000: 0x0405 gives three units, 0x0305 two, 0x0205 five, 0x0105 one. A zero-light offset
+ * arriving in whole multiples of a fixed unit is an accumulator - the converter sums that many LED
+ * pulses into each output sample, and the offset is that many times the per-pulse offset.
+ *
+ * The two channels do not always carry the same count. At 0x0105 channel one sits on one unit and
+ * channel two on two, so a single constant is wrong for the pair as well as for the setting.
+ *
+ * That is why 0x0105 looked broken here. Subtracting three units from a channel carrying one
+ * leaves a negative light level, the ratio gets computed from it anyway, and the configuration was
+ * dismissed as unusable. Taking the pedestal as the largest whole multiple below the measured DC
+ * gives 0.769 there, and gives 0x300000 exactly in the configuration the constant was measured in
+ * - so it costs nothing where the old value was already right.
+ */
+#define DARK_UNIT 1048576.0
+
+static double dark_for(double dc)
+{
+    double units = floor(dc / DARK_UNIT);
+    if (units < 1.0) units = 1.0;
+    return units * DARK_UNIT;
+}
+
 /* Resting ratio-of-ratios for this sensor, measured with bin_amp on a still, healthy wrist.
  * See the SpO2 comment below: this sets the offset of the whole scale, so it is the one number
  * to revisit if saturation ever reads implausibly. */
@@ -507,8 +533,8 @@ static int ratio_windows(const unsigned int *a, const unsigned int *b, int n, do
         for (k = i; k < i + w; k++) { d1 += a[k]; d2 += b[k]; }
         d1 /= w;
         d2 /= w;
-        l1 = d1 - DARK_CODE;
-        l2 = d2 - DARK_CODE;
+        l1 = d1 - dark_for(d1);
+        l2 = d2 - dark_for(d2);
         if (l1 <= 100.0 || l2 <= 100.0) continue;
         x1 = band_amp(a + i, w, fs, bpm / 60.0);
         x2 = band_amp(b + i, w, fs, bpm / 60.0);
@@ -830,8 +856,8 @@ static int beatwise_ratio(const double *ppg, const unsigned int *a, const unsign
 
         /* Against the light each channel received, not the raw code: both sit on a fixed
          * zero-light pedestal that is no part of the signal. */
-        la = a_dc - DARK_CODE;
-        lb = b_dc - DARK_CODE;
+        la = a_dc - dark_for(a_dc);
+        lb = b_dc - dark_for(b_dc);
         if (la < 100.0 || lb < 100.0 || a_ac <= 0 || b_ac <= 0) continue;
 
         rs[nb++] = (a_ac / la) / (b_ac / lb);
@@ -1427,9 +1453,9 @@ int main(int argc, char **argv)
             for (q = 0; q < ns; q++) dc += src[q];
             if (ns) dc /= ns;
             purity = spectral_purity(src, ns, sfs, sbpm);
-            printf(" purity=%.2f level=%.0f%s", purity, dc - DARK_CODE,
-                   level_usable(dc - DARK_CODE) ? ""
-                     : (level_usable_for(dc - DARK_CODE, 1) ? " BELOW-HR-FLOOR" : " OUT-OF-RANGE"));
+            printf(" purity=%.2f level=%.0f%s", purity, dc - dark_for(dc),
+                   level_usable(dc - dark_for(dc)) ? ""
+                     : (level_usable_for(dc - dark_for(dc), 1) ? " BELOW-HR-FLOOR" : " OUT-OF-RANGE"));
         }
         if (sut > 0) {
             printf(" sbp=%.0f dbp=%.0f",
@@ -1499,8 +1525,8 @@ int main(int argc, char **argv)
         for (k = 0; k < ns; k++) { d1 += ch1[k]; d2 += ch2[k]; }
         d1 /= ns;
         d2 /= ns;
-        l1 = d1 - DARK_CODE;
-        l2 = d2 - DARK_CODE;
+        l1 = d1 - dark_for(d1);
+        l2 = d2 - dark_for(d2);
         a1 = band_amp(ch1, ns, rfs, rbpm / 60.0);
         a2 = band_amp(ch2, ns, rfs, rbpm / 60.0);
         {
@@ -1880,8 +1906,8 @@ int main(int argc, char **argv)
                      * saturation floor to the back-off point is about 49,000, so there is room -
                      * not much, which is why the ratio is the harder of the two to satisfy.
                      */
-                    double lvl1 = dc1 - DARK_CODE;
-                    double lvl2 = dc2 - DARK_CODE;
+                    double lvl1 = dc1 - dark_for(dc1);
+                    double lvl2 = dc2 - dark_for(dc2);
                     double lvl, want;
 
                     /* The rate reads whichever channel carries more pulse, so the better of
@@ -1958,8 +1984,8 @@ int main(int argc, char **argv)
         for (k = skip; k < ns; k++) { d1 += ch1[k]; d2 += ch2[k]; }
         d1 /= n;
         d2 /= n;
-        l1 = d1 - DARK_CODE;
-        l2 = d2 - DARK_CODE;
+        l1 = d1 - dark_for(d1);
+        l2 = d2 - dark_for(d2);
 
         /* One frequency, chosen on whichever channel carries more, then applied to both. */
         for (bpm = 40.0; bpm <= 180.0; bpm += 1.0) {
@@ -2074,7 +2100,7 @@ int main(int argc, char **argv)
             a1 = band_amp(ch1, ns, fs, sbpm / 60.0);
             a2 = band_amp(ch2, ns, fs, sbpm / 60.0);
             {
-                double l1 = dc1 - DARK_CODE, l2 = dc2 - DARK_CODE;
+                double l1 = dc1 - dark_for(dc1), l2 = dc2 - dark_for(dc2);
                 if (l1 > 100.0 && l2 > 100.0 && a2 > 0) r = (a1 / l1) / (a2 / l2);
             }
             if (fs > 60.0) pulse_shape(d, ns, fs, sbpm, &sut, &ai);
@@ -2307,7 +2333,7 @@ int main(int argc, char **argv)
             }
             {
                 /* Against the light each channel actually received, not the raw code. */
-                double l1 = dc1 - DARK_CODE, l2 = dc2 - DARK_CODE;
+                double l1 = dc1 - dark_for(dc1), l2 = dc2 - dark_for(dc2);
                 if (l1 > 100.0 && l2 > 100.0 && a2 > 0) r = (a1 / l1) / (a2 / l2);
             }
             /* SpO2 from R, anchored on this sensor rather than on the vendor's.
