@@ -211,10 +211,22 @@ static void adt_start(void)
     cmd(CMD_START);
 }
 
+/* Stop, and turn off what was turned on.
+ *
+ * Stopping the part is not the same as disabling the detector: 0x00c0 bit 0 stays set through a
+ * c4, so the detector remains armed for whatever runs next. That next thing is usually a
+ * measurement - the launcher asks whether the watch is worn immediately before measuring - and a
+ * detector still sampling underneath it is a second consumer of the same front end. Left enabled
+ * it showed up as a gain search that ran away, 0x37b5 against the 0x2828 a good measurement uses,
+ * with the DC reading zero and no window agreeing with any other.
+ */
 static void adt_stop(void)
 {
+    unsigned short v = 0;
+
     cmd(CMD_STOP);
     usleep(500);
+    if (rd16(0x00c0, &v) == 0) wr16(0x00c0, (unsigned short)(v & ~1));
 }
 
 /* Wait for an interrupt, or give up. 1 if one arrived.
