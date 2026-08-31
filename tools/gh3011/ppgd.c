@@ -1738,6 +1738,36 @@ int main(int argc, char **argv)
         usleep(200000);
     }
 
+    /* A ratio wants the vendor's fixed gain, not our search.
+     *
+     * Our loop walks 0x0118 until one channel is out of saturation and stops there, and where it
+     * stops is 0x4a09. At that gain the two channels sit at levels of 4,158 and 52,782 and the
+     * first carries one and a half counts of pulse - which is the faint red channel these notes
+     * have spent a day working around, and it is this loop that makes it faint. The LED is not
+     * faint; the wearer can see it.
+     *
+     * The vendor does not search. 0x0118 is 0x2828 in all three of their configurations and they
+     * regulate elsewhere. Measured against ours on one wrist:
+     *
+     *     0x4a09, ours     levels  4,158 / 52,782   amplitudes  1.5 / 10.9
+     *     0x2828, theirs   levels 26,756 / 27,890   amplitudes 27.0 / 37.5
+     *     0x1d15           levels 12,632 / 20,512   amplitudes 27.9 / 51.9
+     *
+     * Balanced levels and a real pulse on both channels, which is what a ratio of ratios needs and
+     * what ours had not been giving. Three consecutive measurements at 0x2828 gave R of 0.874,
+     * 0.623 and 0.638, all physiological, where ours gives 1.7 to 2.1 on the same wrist.
+     *
+     * Only for the ratio. A rate reads one channel and is better off with that channel driven
+     * hard, which is what the search does well.
+     */
+    if (want_spo2 && !getenv("NOFIXGAIN")) {
+        /* Start where the vendor sits, then let the loop above steer from there. */
+        gain = 0x2828;
+        wr16(0x0136, 0x0000);
+        wr16(0x0118, gain);
+        usleep(50000);
+    }
+
     gettimeofday(&t0, 0);
     tprev = t0;
     for (;;) {
@@ -1836,8 +1866,34 @@ int main(int argc, char **argv)
                  * back-off threshold, so the gain steps down again and again, and what comes out
                  * is the gain moving rather than a pulse. A five hundred count amplitude was read
                  * as a red channel at last driven properly, and it was this. */
+                /* A ratio adapts towards both channels at once, not away from saturation.
+                 *
+                 * The rule below drives until one channel is out of the rail and stops, which the
+                 * bright channel satisfies on its own - so it settles at 0x4a09 with levels of
+                 * 4,158 and 52,782 and one and a half counts of pulse on the faint one. That is
+                 * not a sensor limitation, it is this loop being satisfied too early.
+                 *
+                 * A ratio of ratios needs both channels carrying light. So for saturation, steer
+                 * the weaker of the two into a band rather than the stronger out of the rail:
+                 * raise while the weaker is below it, back off while the stronger is above it,
+                 * and stop when both fit. Measured, the window that holds both is wide enough -
+                 * at 0x2828 the levels are 26,756 and 27,890, at 0x1d15 they are 12,632 and
+                 * 20,512, and both give a real pulse on each channel.
+                 *
+                 * The vendor fixes 0x0118 at 0x2828 instead of searching, which lands in the same
+                 * place for a wrist like this one. Adapting gets there too and keeps the headroom
+                 * when a wrist is darker or brighter than the one this was tuned on.
+                 */
                 if (getenv("FREEZEGAIN")) {
                     /* nothing */
+                } else if (want_spo2) {
+                    double lo_lvl = (dc1 < dc2 ? dc1 : dc2) - DARK_UNIT * 3.0;
+                    double hi_lvl = (dc1 > dc2 ? dc1 : dc2) - DARK_UNIT * 3.0;
+
+                    if (hi_lvl > 48000.0 && gain > 0x1000)
+                        newgain = (unsigned short)(gain - (gain >> 3));   /* the bright one clips */
+                    else if (lo_lvl < 12000.0 && gain < 0xe000)
+                        newgain = (unsigned short)(gain + (gain >> 3));   /* the faint one is dark */
                 } else if (gain > 0x1000 &&
                     (dc1 > 3200000.0 || (want_spo2 && dc2 > 3200000.0)))
                     newgain = (unsigned short)(gain - (gain >> 3));   /* back off about 12% */
