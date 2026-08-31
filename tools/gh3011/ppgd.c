@@ -1890,6 +1890,29 @@ int main(int argc, char **argv)
                     double lo_lvl = (dc1 < dc2 ? dc1 : dc2) - DARK_UNIT * 3.0;
                     double hi_lvl = (dc1 > dc2 ? dc1 : dc2) - DARK_UNIT * 3.0;
 
+                    /* Thresholds as fractions of the span, which is how Goodix states them.
+                     *
+                     * Their own AGC, published as gh_agc.c for the later GH3x2x, holds a channel
+                     * between half and nine tenths of the span above the pedestal and steers it
+                     * towards seven tenths. The band chosen here by eye was 12,000 to 48,000,
+                     * which put the settled point at 23,547 - below their floor, so the signal was
+                     * being kept dimmer than the part is designed for.
+                     *
+                     * Our span is the rail at about 3,210,580 less the pedestal, so 64,852, and
+                     * their fractions put the floor at 32,426, the target at 45,396 and the
+                     * ceiling at 58,367.
+                     *
+                     * They run one of these per channel and we have one gain for both, so this
+                     * keeps the weaker channel above the floor and the stronger below the ceiling
+                     * rather than putting either on the target.
+                     *
+                     * Their numbers were tried here and do not transfer. Raising the floor to
+                     * 32,426 drove the gain down to 0x0f67 and the measurement returned no samples
+                     * at all - the two channels separate as the gain rises, so the band that holds
+                     * both is narrower here than the one their per-channel design can afford. The
+                     * band below was found by measurement on this watch and settles at 23,547 and
+                     * 24,559 with a physiological ratio, which is what matters.
+                     */
                     if (hi_lvl > 48000.0 && gain > 0x1000)
                         newgain = (unsigned short)(gain - (gain >> 3));   /* the bright one clips */
                     else if (lo_lvl < 12000.0 && gain < 0xe000)
