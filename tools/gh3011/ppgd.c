@@ -1074,7 +1074,40 @@ static int shape_beats = 0;    /* beats in the last ensemble, for the report */
  * available says the shape analysis is throwing most of them away, but not whether they were lost
  * at detection or at correlation - and those want opposite fixes. */
 static int shape_peaks = 0;
+static double shape_sut_med = 0, shape_sut_mad = -1;   /* per-beat upstroke, and how much the
+                                                        * beats disagreed about it */
+static int shape_sut_n = 0;
 static double shape_raw_sut = 0, shape_raw_ai = 0;   /* before the gate, for the report */
+
+/* The upstroke of a single beat, in milliseconds, or 0 if its foot cannot be located.
+ *
+ * The same measurement the ensemble gets, applied to one beat. The point is not a better number -
+ * an average of many beats is quieter than any one of them - but a spread: with only the ensemble
+ * there is no way to tell a pass where every beat agreed from one where they did not, and both
+ * publish a pressure with equal confidence. sut moves 110 to 271 ms between passes on a resting
+ * wrist, and this says whether that is the wearer, or beats within a single pass disagreeing.
+ */
+static double beat_sut(const double *w, int wlen, int pre, double fs, double T)
+{
+    int k, foot = -1, lo;
+    double best = -1e18;
+
+    lo = pre - (int)(T * 0.34);
+    if (lo < 1) lo = 1;
+    for (k = pre - 2; k > lo; k--) {
+        double d2 = w[k-1] - 2.0 * w[k] + w[k+1];
+        if (d2 > best) { best = d2; foot = k; }
+    }
+    if (foot < 0) return 0.0;
+    if (w[pre] - w[foot] <= 0) return 0.0;
+    return (pre - foot) / fs * 1000.0;
+}
+
+static int cmp_double(const void *a, const void *b)
+{
+    double x = *(const double *)a, y = *(const double *)b;
+    return x < y ? -1 : (x > y ? 1 : 0);
+}
 
 static void pulse_shape(const double *d, int n, double fs, double bpm, double *sut, double *ai)
 {
@@ -1098,6 +1131,8 @@ static void pulse_shape(const double *d, int n, double fs, double bpm, double *s
     static double ens[MAXW], acc[MAXW];
     int npk = 0, i, j, k, T, pre, post, wlen, used;
     double mx = 0, thr;
+    static double suts[64];          /* one upstroke per accepted beat */
+    int nsut = 0;
 
     *sut = 0;
     *ai = 0;
@@ -1159,6 +1194,8 @@ static void pulse_shape(const double *d, int n, double fs, double bpm, double *s
         used++;
     }
     shape_peaks = npk;
+
+
     if (used < 4) return;
     for (j = 0; j < wlen; j++) ens[j] = acc[j] / used;
 
@@ -1234,6 +1271,16 @@ static void pulse_shape(const double *d, int n, double fs, double bpm, double *s
                 }
             }
             for (j = 0; j < wlen; j++) acc[j] += (seg[j] - lo) / rng;
+            /* Measure this beat on its own before it is averaged away. */
+            if (nsut < (int)(sizeof suts / sizeof suts[0])) {
+                static double one[1024];
+                if (wlen <= (int)(sizeof one / sizeof one[0])) {
+                    double u;
+                    for (j = 0; j < wlen; j++) one[j] = (seg[j] - lo) / rng;
+                    u = beat_sut(one, wlen, pre, fs, T);
+                    if (u > 0) suts[nsut++] = u;
+                }
+            }
             used++;
         }
         if (used >= 4) break;
@@ -1243,6 +1290,25 @@ static void pulse_shape(const double *d, int n, double fs, double bpm, double *s
     if (used < 4) return;
     for (j = 0; j < wlen; j++) ens[j] = acc[j] / used;
     shape_beats = used;
+
+    /* What the beats made of the upstroke individually, before the average hid the disagreement.
+     *
+     * The median is the beats' own figure and the median absolute deviation is how far they sat
+     * from it. A pass where every beat agreed and one where they did not both publish a pressure
+     * with the same confidence otherwise, and there was no way to tell them apart. */
+    if (nsut >= 3) {
+        int q;
+        double devs[64];
+        qsort(suts, nsut, sizeof suts[0], cmp_double);
+        shape_sut_med = suts[nsut / 2];
+        for (q = 0; q < nsut; q++) {
+            devs[q] = suts[q] - shape_sut_med;
+            if (devs[q] < 0) devs[q] = -devs[q];
+        }
+        qsort(devs, nsut, sizeof devs[0], cmp_double);
+        shape_sut_mad = devs[nsut / 2];
+        shape_sut_n = nsut;
+    }
 
     /* Measure once, on the average. The peak sits at pre by construction. */
     {
@@ -1440,8 +1506,10 @@ int main(int argc, char **argv)
             sbpm = spectral_bpm_d(dw, ns, sfs, &conf);
         }
         pulse_shape(dw, ns, sfs, sbpm, &sut, &ai);
-        printf("bpm=%.0f beats=%d/%d raw=%.0f/%.2f sut=%.0f ai=%.2f", sbpm, shape_beats, shape_peaks,
-               shape_raw_sut, shape_raw_ai, sut, ai);
+        printf("bpm=%.0f beats=%d/%d raw=%.0f/%.2f sut=%.0f ai=%.2f sutmed=%.0f sutmad=%.0f sutn=%d",
+               sbpm, shape_beats, shape_peaks,
+               shape_raw_sut, shape_raw_ai, sut, ai,
+               shape_sut_med, shape_sut_mad, shape_sut_n);
 
         /* Say how much of the band the pulse actually is, and whether the level allowed the
          * question to be asked. Reported rather than enforced: the caller decides what to do with
@@ -2507,12 +2575,17 @@ int main(int argc, char **argv)
 
             printf("hr=%.0f spread=%.0f hz=%.1f samples=%d windows=%d gain=%04x"
                    " dc1=%.0f dc2=%.0f ac1=%.0f ac2=%.0f r=%.3f spo2=%.0f beats=%d raw=%.0f/%.2f sut=%.0f ai=%.2f motion=%.0f/%.0f"
-                   " conf=%.2f peaks=%d sbp=%.0f dbp=%.0f used=%s%s\n",
+                   " conf=%.2f peaks=%d sutmed=%.0f sutmad=%.0f sutn=%d sbp=%.0f dbp=%.0f used=%s%s\n",
                    med, spread, fs, ns, nrates, gain, dc1, dc2, a1, a2, r, spo2, shape_beats, shape_raw_sut, shape_raw_ai, sut, ai, mot_med, mot_worst,
                    /* Within two bpm, which is about what the reference itself holds to: the cuff
                     * moved between 58 and 61 across four minutes on a resting wearer, so a
                     * tighter tolerance would claim more than anything here can check. */
-                   confidence_p(rates, nrates, 2.0), shape_peaks, sbp, dbp,
+                   /* sutmed and sutmad are the upstroke as the individual beats measured it and
+                    * how far they sat from it - the pass's own account of whether its beats
+                    * agreed. sut above is from the ensemble and is what the pressure uses; this
+                    * says how much to believe it. */
+                   confidence_p(rates, nrates, 2.0), shape_peaks,
+                   shape_sut_med, shape_sut_mad, shape_sut_n, sbp, dbp,
                    src == ch2 ? "ch2" : "ch1",
                    /* Say so when the windows did not agree on their own and the previous rate
                     * chose between them. Worth having under motion, and not the same claim as a
