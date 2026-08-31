@@ -396,8 +396,22 @@ static void measure(const char *mode, char *out, size_t outsz)
      *
      * If the sensor will not say, measure anyway: a missing thermometer is a reason to fall back
      * to the slow answer, not to refuse to answer at all. */
-    t = read_temp(8);
-    if (t >= 0 && t < WORN_C) {
+    /* The same check before a measurement, and for the same reason it is quick now. This used to
+     * spend eight seconds on the thermometer before every reading, including the ones that were
+     * going to fail because nobody was wearing the watch. */
+    {
+        int adt = adt_worn(3000);
+        if (adt == 0) {
+            snprintf(out, outsz, "hr=0 reason=not_worn adt=0\n");
+            return;
+        }
+        /* Still read the temperature, just without waiting for it: the reading carries temp=
+         * and the launcher shows it. One try rather than eight because the thermopile is left
+         * enabled between measurements, so it answers at once unless this is the first read
+         * since boot - and a missing temperature is worth less than eight seconds. */
+        t = adt > 0 ? read_temp(1) : read_temp(8);
+    }
+    if (t > 0 && t < WORN_C) {
         snprintf(out, outsz, "hr=0 reason=not_worn temp=%d.%02d\n", t / 100, t % 100);
         return;
     }
@@ -656,26 +670,28 @@ int main(void)
         if (strcmp(req, "wear") == 0) {
             /* Answerable without lighting an LED, so the launcher can skip a measurement it
              * already knows will fail. */
-            /* Both sources, and the thermometer decides.
+            /* The sensor decides, and the thermometer is the fallback.
              *
-             * The chip's detector is the better instrument in principle - immediate, and
-             * measuring the thing itself rather than a temperature a radiator would also raise.
-             * It does not decide yet because it has not been shown to be right: three readings
-             * of its register were confidently wrong before its protocol was understood, and a
-             * wear check that wrongly says no suppresses every measurement behind it. It is
-             * reported so the logs can accumulate the agreement, and adt= becoming the decision
-             * is then a one-line change with evidence behind it rather than a hope.
+             * This was the other way round until the detector was made to work. It is the better
+             * instrument and now behaves like it: about a second against the thermometer's eight,
+             * and it detects a wrist rather than warmth, which a pocket or a radiator also
+             * supplies. Five runs each way separated cleanly - worn on every on-wrist run,
+             * including with the arm still, and silence on every off-wrist one.
+             *
+             * The thermometer stays for the case where the helper is missing or the device is
+             * busy, where adtwear answers -1. Both are reported either way, so a disagreement
+             * shows up in the log rather than being averaged away.
              */
-            int wt = read_temp(8);
-            int adt = adt_worn(2000);
-            int at = 0;
+            int adt = adt_worn(3000);
+            int wt = adt >= 0 ? -1 : read_temp(8);
+            int worn = adt >= 0 ? adt : (wt > 0 ? (wt >= WORN_C ? 1 : 0) : -1);
+            int at = snprintf(reply, sizeof reply, "worn=%d adt=%d", worn, adt);
 
             if (wt > 0)
-                at = snprintf(reply, sizeof reply, "worn=%d temp=%d.%02d",
-                              wt >= WORN_C ? 1 : 0, wt / 100, wt % 100);
-            else
-                at = snprintf(reply, sizeof reply, "worn=-1 reason=no_thermometer");
-            snprintf(reply + at, sizeof reply - at, " adt=%d\n", adt);
+                at += snprintf(reply + at, sizeof reply - at, " temp=%d.%02d", wt / 100, wt % 100);
+            else if (worn < 0)
+                at += snprintf(reply + at, sizeof reply - at, " reason=no_source");
+            snprintf(reply + at, sizeof reply - at, "\n");
         } else {
             measure(req, reply, sizeof reply);
             logline(req, reply);

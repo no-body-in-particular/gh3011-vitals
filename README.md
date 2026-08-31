@@ -15,7 +15,7 @@ else from here.
 | heart rate | measured against a cuff at about +1 bpm, three of four measurements inside two |
 | blood pressure | tracks poorly - the estimate sits near 114 whether the wearer is at 105 or 120 |
 | saturation | a ratio, not a percentage. 0.70 with seven percent of spread when there is a pulse to measure |
-| wear detection | thermopile, validated at 34.6 on a wrist against 26.5 on a table |
+| wear detection | the sensor's own detector, about a second, five runs each way with no overlap |
 
 No saturation percentage is published, deliberately. The ratio is real; turning it into a number
 out of ten requires a calibration this has no reference for, and a one-point anchor once printed

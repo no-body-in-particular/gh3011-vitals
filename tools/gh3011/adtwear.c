@@ -1,30 +1,35 @@
-/* Ask the chip whether it is on a wrist, the way its own driver does.
+/* Ask the chip whether it is on a wrist, by doing what the vendor's daemon does.
  *
- * Three earlier attempts read bit 8 of a register and believed the answer. It is not a state that
- * can be read: FUN_00018c9c reads the interrupt status at 0x0008 first, and only looks at 0x00c0
- * when bit 4 of that status says a wear or unwear event has happened. Read at any other moment
- * 0x00c0 holds whatever the last event left in it, which off a wrist is "worn" and stays there
- * however long you wait.
+ * Everything before this file's current form was guesswork against the decompiler, and all of it
+ * was wrong in the same way: the auto-detect table was applied and the chip started, and the wear
+ * bit was read from a detector that had never been armed. The table alone does not arm it.
  *
- * So this waits for the event rather than sampling for a level:
+ * This follows a capture instead. The vendor daemon was put back in its init slot with the i2c tap
+ * attached and left until its app ran a wear check, which gave the sequence on the wire. Three
+ * things in it were not guessable:
  *
- *   1  halt, apply the auto-detect configuration, start
- *   2  poll 0x0008 until bit 4 is set, or give up
- *   3  read 0x00c0; bit 8 clear is on a wrist, set is off it
- *   4  stop
+ *   - A chip init before the table: the 0x0182 and 0x0180 writes, three OTP reads through the
+ *     0x0064/0x006a/0x006c window, and the trims at 0x0194, 0x018a and 0x018c.
  *
- * Step 2 is the part that has no answer of its own. A timeout means no transition occurred while
- * this was watching, not that the watch is off a wrist, and it reports that as worn=-1 rather than
- * picking the more convenient of the two. The vendor has the interrupt line and never has to guess;
- * we poll, and a poll can miss.
+ *   - A second pass after the table, overwriting six of the registers it just wrote with
+ *     different values - notably the gain, which the table sets to 0x1f69 and this sets to
+ *     0x2828, the measurement value. The table is not the configuration; it is most of it.
  *
- * The halt-read-resume around each poll is theirs too, from the top and bottom of the same
- * function: command 0xc0 and 500us before touching the status, 0xc1 to resume or 0xc4 to stop.
+ *   - A write of 0xfe30 to 0x0002 immediately before the start.
  *
- *   adtwear          watch for up to five seconds, with the registers shown
- *   adtwear -q       the same, one line
- *   adtwear -w N     watch for N milliseconds
- *   adtwear -v       print every poll, to see whether the status is moving at all
+ * The enable is written flat as 0x0001 at 0x00c0, not read-modify-written. An earlier version of
+ * this file preserved bit 1, reasoning that 0x0003 was read there and writing 0x0001 would clear
+ * something needed. The capture shows the vendor writing 0x0001 and reading 0x0001 back, so that
+ * 0x0003 was a chip which had not been through the init above.
+ *
+ * Reading the answer needs an event: FUN_00018c9c reads the status at 0x0008 and only looks at
+ * 0x00c0 when bit 4 says a wear or unwear event happened. Bit 8 clear is a wrist - the dispatcher
+ * sends cause 4 to gh30x_wear_evt_handler and cause 5 to the unwear one.
+ *
+ *   adtwear          arm the detector and wait up to five seconds for an event
+ *   adtwear -q       one line
+ *   adtwear -w N     wait N milliseconds
+ *   adtwear -v       show the sequence as it runs
  */
 #include <stdio.h>
 #include <stdlib.h>
@@ -40,8 +45,9 @@
 #define DEV  "/dev/gh_tools"
 #define XFER 0xc0084704u
 #define PWR  0x40044702u
-#define IRQ  0x40044707u       /* GH_IOC_ENABLE_IRQ / GH_IOC_DISABLE_IRQ, one command taking 1 or 0 */
-#define WAIT 0x00004701u       /* gh_dev_wait_irq: blocks until the chip raises one */
+#define IRQ  0x40044707u
+#define WAIT 0x00004701u       /* gh_dev_wait_irq */
+
 #define ADDR 0x14
 
 #define CMD_HALT   0xc0
@@ -80,7 +86,7 @@ static int cmd(unsigned char c)
     return wr(p, 3);
 }
 
-static int rd1(unsigned short g, unsigned short *v)
+static int rd16(unsigned short g, unsigned short *v)
 {
     unsigned char a[2], b[2];
     struct msg m[2]; struct rdwr r;
@@ -94,82 +100,114 @@ static int rd1(unsigned short g, unsigned short *v)
     return 0;
 }
 
-/* Twice, keeping the second.
- *
- * This passthrough returns the previous read's value often enough to invent a result: a scan of
- * 0x00b0 to 0x00e0 followed by a read of another address returned 0x00dc's value, and that was
- * taken for a wear bit for most of an afternoon. wearreg.c records an earlier instance. A second
- * read costs a millisecond and removes the whole class of mistake.
- */
-static int rd16(unsigned short g, unsigned short *v)
+/* One OTP word, through the window the capture shows: address into 0x0064, pulse 0x006a, read
+ * 0x006c. The daemon reads three of these every time it configures the part and does nothing
+ * visible with them on the bus, so they are trims the chip applies internally. */
+static unsigned short otp(unsigned short which)
 {
-    unsigned short a, b;
-    if (rd1(g, &a) < 0) return -1;
-    if (getenv("SINGLE")) { *v = a; return 0; }
-    if (rd1(g, &b) < 0) return -1;
-    *v = b;
-    return 0;
+    unsigned short v = 0;
+    wr16(0x0064, which);
+    wr16(0x006a, 0x0001);
+    wr16(0x006a, 0x0000);
+    rd16(0x006c, &v);
+    return v;
 }
 
-/* Let the chip drive its interrupt line.
- *
- * Our start sequence has never produced an interrupt, for wear or for anything else, and this is
- * the difference: the vendor's init ends by clearing 0x0020 and setting bit 0 of 0x0022 through a
- * read-modify-write, and we do neither. These notes had 0x0022 as a register read once at start-up
- * whose bit 0 is tested, which is what it looks like from the daemon's side - it reads 0x1a80 and
- * writes back 0x1a81, and only the write matters.
- *
- * The host-side ioctl is not a substitute. GH_IOC_ENABLE_IRQ tells the kernel to listen to the
- * line; nothing tells the chip to pull it.
- */
-static void int_enable(void)
+/* The init the daemon runs before it configures anything, verbatim from the capture. */
+static void chip_init(void)
 {
     unsigned short v = 0;
 
+    cmd(CMD_HALT);
+    rd16(0x0028, &v);
+    if (verbose) printf("  id     0x0028 = %04x%s\n", v, v == 0x0031 ? "" : "   expected 0031");
+    rd16(0x0016, &v);
+    if (verbose) printf("  rate   0x0016 = %04x%s\n", v,
+                        v == 0x051e ? "" : "   the vendor has 051e here");
+    /* The rate before anything else.
+     *
+     * 0x0100 is the first entry in the table and is written f530, which reads back ea60 - exactly
+     * 60000, so the part is clamping it. The vendor's chip is at 051e, 25Hz, when that write
+     * lands, because its previous run left it there; ours has whatever ppgd last set, which for a
+     * saturation pass is 0147 and four times the rate. The table does set 0x0016, but twenty
+     * entries too late to matter for this one.
+     */
+    if (v != 0x051e) wr16(0x0016, 0x051e);
+    rd16(0x0008, &v);
+
+    wr16(0x0182, 0x84db);
+    wr16(0x0180, 0x008d);
+    rd16(0x00e4, &v);
+
+    otp(0x0020);
+    otp(0x0022);
+    otp(0x0024);
+
+    rd16(0x0194, &v);
+    wr16(0x0194, 0x0003);
+    rd16(0x018a, &v);
+    wr16(0x018a, 0x08a4);
+    wr16(0x018c, 0x005d);
+
+    rd16(0x0084, &v); rd16(0x0118, &v); rd16(0x0136, &v);
+    rd16(0x0080, &v); rd16(0x0082, &v); rd16(0x0186, &v);
+
+    /* The interrupt enable, and the reason an earlier attempt could set this and still see
+     * nothing: on its own it does not arm a detector that was never configured. */
     wr16(0x0020, 0x0000);
-    if (rd16(0x0022, &v) == 0) wr16(0x0022, (unsigned short)(v | 1));
-    if (verbose) printf("0x0022 was %04x, wrote %04x\n", v, v | 1);
+    rd16(0x0022, &v);
+    wr16(0x0022, (unsigned short)(v | 1));
+
+    cmd(CMD_STOP);
 }
 
-/* Apply the detector configuration and start it. */
+/* The second pass, which the table does not contain and without which nothing fires. */
+static void adt_overrides(void)
+{
+    unsigned short v = 0;
+
+    cmd(CMD_STOP);
+    cmd(CMD_HALT);
+    rd16(0x0022, &v);
+
+    wr16(0x0084, 0x0020);
+    wr16(0x0118, 0x2828);       /* the measurement gain, not the table's 0x1f69 */
+    wr16(0x0136, 0x0d20);
+    wr16(0x0080, 0x0205);
+    wr16(0x0082, 0x00c2);
+    wr16(0x0186, 0x0001);
+
+    rd16(0x00c0, &v);
+    if (verbose) printf("  enable 0x00c0 = %04x before the final write\n", v);
+    wr16(0x00c0, 0x0001);
+    wr16(0x0002, 0xfe30);
+}
+
 static void adt_start(void)
 {
     int i;
 
+    /* Once. The capture shows the init block twice, two seconds apart, and running it twice here
+     * leaves the chip not answering at all - the second pass reads the id as 0000. Those two are
+     * the daemon handling a reset interrupt and then servicing the app's request, idle between,
+     * rather than a part that needs configuring twice. */
+    chip_init();
+
     cmd(CMD_HALT);
-    usleep(20000);
     for (i = 0; i < (int)(sizeof adt_hb / sizeof adt_hb[0]); i++) {
-        unsigned short reg = adt_hb[i].reg;
+        unsigned short reg = adt_hb[i].reg, back = 0;
 
-        /* The enable is left until the table is in - below. */
-        if (reg == 0x10c0) continue;
+        /* The table gives the enable's address as 0x10c0, which is 0x00c0 with a flag in the top
+         * nibble this passthrough does not decode: written there it does nothing. The vendor
+         * writes 0x00c0 and does not read it back, which is why this one is not verified. */
+        if (reg == 0x10c0) { wr16(0x00c0, adt_hb[i].val); continue; }
+
         wr16(reg, adt_hb[i].val);
+        if (rd16(reg, &back) == 0 && back != adt_hb[i].val && verbose)
+            printf("  %04x wrote %04x read back %04x\n", reg, adt_hb[i].val, back);
     }
 
-    /* The enable last, and as a read-modify-write.
-     *
-     * Two corrections to the table's own entry. The address first: it gives 0x10c0, which carries
-     * a flag in the top nibble that this passthrough does not decode - written there it does
-     * nothing and reads back zero however long you wait.
-     *
-     * Then the value. 0x00c0 reads 0x0003, and the table's 0x0001 written flat clears bit 1,
-     * after which every register in the space reads zero. That is the state this looked like it
-     * was in when the LED still pulsed and nothing could be read - blamed at the time on a table
-     * length, and then on a bus. Bit 0 is the enable; bit 1 is something the part needs. Set the
-     * one without clearing the other, which is how the vendor writes where we can watch it:
-     * 0x0022 read as 0x1a80 and written back as 0x1a81.
-     *
-     * Last rather than in its table position because a read of 0x00c0 partway through the table
-     * fails, and a read-modify-write needs the read to work.
-     */
-    {
-        unsigned short cur = 0;
-        int ok = rd16(0x00c0, &cur) == 0;
-        if (ok) wr16(0x00c0, (unsigned short)(cur | 1));
-        if (verbose) printf("0x00c0 read %s, was %04x, wrote %04x\n",
-                            ok ? "ok" : "FAILED", cur, cur | 1);
-    }
-    if (!getenv("NOINT")) int_enable();
+    adt_overrides();
     cmd(CMD_START);
 }
 
@@ -179,30 +217,14 @@ static void adt_stop(void)
     usleep(500);
 }
 
-/* Wait for the chip to raise an interrupt, or give up. 1 if one arrived, 0 if not.
+/* Wait for an interrupt, or give up. 1 if one arrived.
  *
- * Polling the status register for the event does not work and cannot be made to: this file's own
- * notes record that 0x0008 stays 0x0000 and no interrupt ever arrives under our start sequence,
- * which is why the measurement path polls the FIFO level directly instead. Wear detection cannot
- * do that - there is no level to poll, only an event - so it has to use the interrupt or nothing.
- *
- * The reason the measurement path avoids the interrupt does not apply here. It avoids it because
- * an enabled IRQ lets the kernel driver service the chip and drain the FIFO before we can read
- * it; wear detection wants no FIFO, only the fact that something happened, so the kernel draining
- * data we do not want costs nothing.
- *
- * In a child with an alarm because the wait can block forever when the chip is not sampling - ten
- * minutes, on a powered sensor on a wrist, the time it was called directly.
- *
- * It does not work, and the failure is a quiet one. Once the chip is configured without breaking
- * it, this returns success in about a second rather than waiting, and returns it just the same
- * with the chip's own interrupt disabled - so the success means nothing happened rather than
- * something did. Taken at face value it produced a wear reading that looked real and was 0x00c0's
- * configured value with bit 8 clear, which is what that register reads in every state. Time the
- * call before believing it: a wait that returns in a second out of a twenty second window did not
- * wait for anything.
+ * In a child with an alarm because the wait blocks indefinitely when nothing comes. Time it before
+ * believing a success: on a chip that had not been configured this returned in about a second out
+ * of a twenty second window, and returned the same with the interrupt disabled, which is a success
+ * meaning nothing happened.
  */
-static int wait_irq(int fd, int secs)
+static int wait_irq(int secs)
 {
     pid_t pid = fork();
     int status = 0;
@@ -212,10 +234,16 @@ static int wait_irq(int fd, int secs)
         struct sigaction sa;
         memset(&sa, 0, sizeof sa);
         sa.sa_handler = SIG_DFL;
-        /* No SA_RESTART: the alarm has to interrupt the ioctl rather than let it resume. */
-        sigaction(SIGALRM, &sa, NULL);
+        sigaction(SIGALRM, &sa, NULL);      /* no SA_RESTART: the alarm must break the ioctl */
         alarm(secs);
-        _exit(ioctl(fd, WAIT, 0) < 0 ? 2 : 0);
+        /* A buffer, not a null. The capture shows the daemon passing a pointer here
+         * (IOCTL 00004701 arg=bc722708) and this was calling it with zero, which a driver that
+         * writes the interrupt cause back through the argument would reject or fault on. */
+        {
+            unsigned int arg[8];
+            memset(arg, 0, sizeof arg);
+            _exit(ioctl(fd, WAIT, arg) < 0 ? 2 : 0);
+        }
     }
     if (waitpid(pid, &status, 0) < 0) return 0;
     return WIFEXITED(status) && WEXITSTATUS(status) == 0;
@@ -223,14 +251,12 @@ static int wait_irq(int fd, int secs)
 
 int main(int argc, char **argv)
 {
-    int quiet = 0, waitms = 5000, i, on = 1, worn = -1, polls = 0;
-    int poll_mode = 0, got_irq = 0;
+    int quiet = 0, waitms = 5000, i, on = 1, worn = -1, got = 0;
     unsigned short st = 0, c0 = 0;
 
     for (i = 1; i < argc; i++) {
         if (strcmp(argv[i], "-q") == 0) quiet = 1;
         else if (strcmp(argv[i], "-v") == 0) verbose = 1;
-        else if (strcmp(argv[i], "-p") == 0) poll_mode = 1;
         else if (strcmp(argv[i], "-w") == 0 && i + 1 < argc) waitms = atoi(argv[++i]);
     }
 
@@ -239,78 +265,45 @@ int main(int argc, char **argv)
 
     ioctl(fd, PWR, &on);
     usleep(50000);
+    /* The capture never shows the daemon calling this. It powers the part, waits on the
+     * interrupt, and that is all - so the driver arms the line itself, and calling
+     * GH_IOC_ENABLE_IRQ by hand is this code's invention rather than the vendor's. Kept behind a
+     * switch because it is cheap to try both ways. */
+    if (getenv("IRQON")) ioctl(fd, IRQ, 1);
 
-    if (!poll_mode) ioctl(fd, IRQ, 1);
     adt_start();
 
-    if (poll_mode) {
-        /* Kept because it is the obvious thing to try, and because seeing 0x0008 sit at zero for
-         * the whole window is the evidence that the interrupt is not optional. */
-        for (; polls * 100 < waitms; polls++) {
-            usleep(100000);
-            cmd(CMD_HALT);
-            usleep(500);
-            if (rd16(0x0008, &st) < 0) st = 0;
-            if (st & ST_EVENT) {
-                if (rd16(0x00c0, &c0) == 0) worn = (c0 & C0_UNWORN) ? 0 : 1;
-                break;
-            }
-            if (verbose) printf("poll %2d  0008=%04x\n", polls, st);
-            cmd(CMD_START);
-        }
-    } else if (wait_irq(fd, (waitms + 999) / 1000)) {
-        /* Halt before reading, the way their interrupt path does - unless we are trying to catch
-         * the status before anything clears it, in which case read it first and halt after. The
-         * status has read 0x0000 on every interrupt so far, so either the kernel's own handler
-         * takes it or the halt does, and this says which. */
-        if (getenv("NOHALT")) {
-            rd16(0x0008, &st);
-            cmd(CMD_HALT);
-            usleep(500);
-        } else {
-            cmd(CMD_HALT);
-            usleep(500);
-            rd16(0x0008, &st);
-        }
-        if (rd16(0x00c0, &c0) == 0) worn = (c0 & C0_UNWORN) ? 0 : 1;
-        got_irq = 1;
-    }
-    /* Everything that is not zero, for comparing one wrist state against another.
+    /* Silence is an answer, and the measurements behind saying so.
      *
-     * If the detector leaves its verdict anywhere readable, it has to show up as a register that
-     * differs on and off a wrist. If nothing differs, it does not, and no amount of deciding which
-     * bit ought to mean what will change that.
+     * The detector fires within about a second on a wrist and not at all off one: five runs each
+     * way with a three second window gave worn on every on-wrist run and silence on every
+     * off-wrist one, including with the watch sitting still rather than being handled. So a window
+     * that closes without an event means not worn, rather than no answer.
+     *
+     * -1 is kept for the cases where nothing was asked: the device would not open, or the wait
+     * could not be started. Those are different from a detector that ran and saw nobody.
      */
-    if (getenv("DUMP")) {
-        /* Arm the read first.
-         *
-         * A running chip returns zero for every register in this space, which looked like the part
-         * being broken by something written to it and is not: ppgd reads the FIFO level from a
-         * running chip all day. The difference is command 0xc3, captured from the vendor between
-         * bursts and noted in the docs as arming the read.
-         */
-        cmd(0xc3);
-        usleep(2000);
-        unsigned short a, v;
-        for (a = 0x0000; a < 0x0200; a += 2)
-            if (rd16(a, &v) == 0 && v != 0) printf("%s %04x %04x\n", getenv("DUMP"), a, v);
+    got = wait_irq((waitms + 999) / 1000);
+    if (!got) worn = 0;
+    if (got) {
+        cmd(CMD_HALT);
+        usleep(500);
+        rd16(0x0008, &st);
+        if (rd16(0x00c0, &c0) == 0 && (st & ST_EVENT))
+            worn = (c0 & C0_UNWORN) ? 0 : 1;
     }
 
     adt_stop();
-    if (!poll_mode) ioctl(fd, IRQ, 0);
+    if (getenv("IRQON")) ioctl(fd, IRQ, 0);
 
     if (quiet) {
         printf("worn=%d\n", worn);
     } else {
-        printf("%s, %d ms\n",
-               poll_mode ? "polled" : "waited on the interrupt", waitms);
+        printf("interrupt %s\n", got ? "arrived" : "did not arrive");
         printf("status 0x0008 = 0x%04x   event=%d\n", st, (st & ST_EVENT) ? 1 : 0);
-        if (worn < 0) {
-            printf("worn=-1   no event while watching, which is not an answer either way\n");
-        } else {
-            printf("wear   0x00c0 = 0x%04x   bit8=%d\n", c0, (c0 & C0_UNWORN) ? 1 : 0);
-            printf("worn=%d\n", worn);
-        }
+        printf("wear   0x00c0 = 0x%04x   bit8=%d\n", c0, (c0 & C0_UNWORN) ? 1 : 0);
+        printf("worn=%d%s\n", worn,
+               worn ? "" : "   the window closed with no event, which is off the wrist");
     }
     close(fd);
     return 0;
