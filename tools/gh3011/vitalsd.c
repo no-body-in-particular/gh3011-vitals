@@ -23,6 +23,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <math.h>
 #include <unistd.h>
 #include <signal.h>
 #include <errno.h>
@@ -192,6 +193,69 @@ static int read_steps(void)
     }
     close(fd);
     return ok;
+}
+
+/* The accelerometer, read the same way as the steps and for the same reason.
+ *
+ * Six bytes from 0x02 - X, Y, Z as LSB then MSB - each pair combined and shifted right by an
+ * amount the resolution decides, then sign-extended. 0x0f carries both settings: bits 1:0 the
+ * range (0=2g, 1=4g, 2=8g, 3=16g) and bits 3:2 the resolution (0=14 bit, 1=12, 2=10, 3=8).
+ * This watch holds 0x01, so 4g at 14 bits: shift 2, full scale 8191, 4000/8191 mg per count.
+ *
+ * Read rather than assumed, because assuming a register cost a day's step counts already.
+ *
+ * From github.com/gaupen1186/DA217_Driver, which carries the datasheet this is not otherwise
+ * published in.
+ */
+static int accel_shift = -1, accel_max = 8191;
+static double accel_lsb_g = 0.0;
+
+static int accel_setup(int fd)
+{
+    unsigned char reg = 0x0f, v = 0;
+    int range_mg;
+
+    if (write(fd, &reg, 1) != 1 || read(fd, &v, 1) != 1) return -1;
+    switch ((v >> 2) & 3) {
+    case 0: accel_shift = 2; accel_max = 8191; break;
+    case 1: accel_shift = 4; accel_max = 2047; break;
+    case 2: accel_shift = 6; accel_max =  511; break;
+    default: accel_shift = 8; accel_max =  127; break;
+    }
+    switch (v & 3) {
+    case 0: range_mg = 2000; break;
+    case 1: range_mg = 4000; break;
+    case 2: range_mg = 8000; break;
+    default: range_mg = 16000; break;
+    }
+    accel_lsb_g = (double) range_mg / 1000.0 / (double) accel_max;
+    return 0;
+}
+
+/* One sample in g, or -1. */
+static int read_accel(int fd, double *gx, double *gy, double *gz)
+{
+    unsigned char reg = 0x02, b[6];
+    int i;
+    double *out[3];
+
+    out[0] = gx; out[1] = gy; out[2] = gz;
+    if (write(fd, &reg, 1) != 1 || read(fd, b, 6) != 6) return -1;
+    for (i = 0; i < 3; i++) {
+        int r = ((b[i * 2 + 1] << 8) | b[i * 2]) >> accel_shift;
+        if (r > accel_max) r -= (accel_max + 1) * 2;
+        *out[i] = r * accel_lsb_g;
+    }
+    return 0;
+}
+
+static int accel_open(void)
+{
+    int fd = open(DA217_BUS, O_RDWR);
+    if (fd < 0) return -1;
+    if (ioctl(fd, I2C_SLAVE_FORCE, DA217_ADDR) < 0) { close(fd); return -1; }
+    if (accel_shift < 0 && accel_setup(fd) < 0) { close(fd); return -1; }
+    return fd;
 }
 
 static void logline(const char *mode, const char *line)
@@ -791,6 +855,59 @@ int main(void)
             else if (worn < 0)
                 at += snprintf(reply + at, sizeof reply - at, " reason=no_source");
             snprintf(reply + at, sizeof reply - at, "\n");
+        } else if (strncmp(req, "accel", 5) == 0) {
+            /* The accelerometer, so nothing needs the vendor's driver.
+             *
+             * The DA217 provides both the step counter and the accelerometer, and the driver that
+             * owns it delivers steps to nobody. Serving both from here makes that driver removable
+             * rather than merely bypassed - which also ends the I2C_SLAVE_FORCE, since nothing
+             * else would hold the address.
+             *
+             * A bare "accel" gives one sample. "accel <ms>" samples for that long and returns the
+             * sums the sleep recorder builds, rather than the samples themselves: it reduces every
+             * burst to these nine numbers anyway, and eighty triples do not fit in a reply.
+             */
+            int ms = atoi(req + 5);
+            int afd = accel_open();
+
+            if (afd < 0) {
+                snprintf(reply, sizeof reply, "n=0 reason=no_accelerometer\n");
+            } else if (ms <= 0) {
+                double x = 0, y = 0, z = 0;
+                if (read_accel(afd, &x, &y, &z) == 0)
+                    snprintf(reply, sizeof reply, "x=%.4f y=%.4f z=%.4f\n", x, y, z);
+                else
+                    snprintf(reply, sizeof reply, "n=0 reason=read_failed\n");
+                close(afd);
+            } else {
+                double sx = 0, sy = 0, sz = 0, smag = 0, smagsq = 0, senmo = 0;
+                double lo = 1e9, hi = -1e9;
+                int n = 0, ticks;
+
+                if (ms > 20000) ms = 20000;
+                /* Sixteen a second, which is what SENSOR_DELAY_UI gave the recorder. */
+                for (ticks = 0; ticks < ms / 62; ticks++) {
+                    double x = 0, y = 0, z = 0, mag;
+                    if (read_accel(afd, &x, &y, &z) < 0) { usleep(62000); continue; }
+                    mag = sqrt(x * x + y * y + z * z);
+                    sx += x; sy += y; sz += z;
+                    smag += mag; smagsq += mag * mag;
+                    senmo += mag > 1.0 ? mag - 1.0 : 0.0;
+                    if (mag < lo) lo = mag;
+                    if (mag > hi) hi = mag;
+                    n++;
+                    usleep(62000);
+                }
+                close(afd);
+                if (n == 0)
+                    snprintf(reply, sizeof reply, "n=0 reason=read_failed\n");
+                else
+                    snprintf(reply, sizeof reply,
+                             "n=%d sx=%.4f sy=%.4f sz=%.4f smag=%.4f smagsq=%.4f senmo=%.4f"
+                             " minmag=%.4f maxmag=%.4f\n",
+                             n, sx, sy, sz, smag, smagsq, senmo, lo, hi);
+            }
+            logline("accel", reply);
         } else if (strcmp(req, "steps") == 0) {
             /* The step counter, read off the bus rather than through the sensor framework.
              *
