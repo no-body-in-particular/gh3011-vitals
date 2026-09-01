@@ -150,6 +150,36 @@ static int read_temp(int patience)
  */
 #define VLOG "/sdcard/vitals.log"
 
+/* Cumulative steps from the DA217 at 2-0026, or -1.
+ *
+ * 0x0e and 0x0f, little endian. Found by dumping the map, walking, dumping again and taking the
+ * pair that moved by about the number of steps taken - the same way the wear bit was found, and
+ * for the same reason: three earlier answers here came from reading code instead of the part.
+ *
+ * I2C_SLAVE_FORCE because the da217 driver holds the address, so the polite ioctl is refused.
+ * This only ever reads, and the driver is not producing anything to disturb.
+ */
+#define I2C_SLAVE_FORCE 0x0706
+#define DA217_ADDR      0x26
+#define DA217_BUS       "/dev/i2c-2"
+#define DA217_STEPS_LO  0x0e
+
+static int read_steps(void)
+{
+    unsigned char reg = DA217_STEPS_LO, v[2];
+    int fd, ok = -1;
+
+    fd = open(DA217_BUS, O_RDWR);
+    if (fd < 0) return -1;
+    if (ioctl(fd, I2C_SLAVE_FORCE, DA217_ADDR) >= 0
+        && write(fd, &reg, 1) == 1
+        && read(fd, v, 2) == 2) {
+        ok = v[0] | (v[1] << 8);
+    }
+    close(fd);
+    return ok;
+}
+
 static void logline(const char *mode, const char *line)
 {
     FILE *f = fopen(VLOG, "a");
@@ -747,6 +777,22 @@ int main(void)
             else if (worn < 0)
                 at += snprintf(reply + at, sizeof reply - at, " reason=no_source");
             snprintf(reply + at, sizeof reply - at, "\n");
+        } else if (strcmp(req, "steps") == 0) {
+            /* The step counter, read off the bus rather than through the sensor framework.
+             *
+             * The launcher registers for the counter both ways the framework offers, a listener
+             * and a trigger, and has never had a number out of either - its input device is
+             * enabled and delivered nothing across twenty-five seconds of walking. The chip is
+             * counting perfectly well underneath that: a DA217 at 2-0026, whose 0x0e/0x0f pair
+             * rose by 21 over a thirty second walk and holds steady when the wrist is still.
+             *
+             * So the driver is where it stops. Reading the part directly needs root and the
+             * launcher has none, which is the same reason the measurement lives here.
+             */
+            int n = read_steps();
+            if (n >= 0) snprintf(reply, sizeof reply, "steps=%d\n", n);
+            else snprintf(reply, sizeof reply, "steps=-1 reason=no_counter\n");
+            logline(req, reply);
         } else if (strcmp(req, "temp") == 0) {
             /* The thermometer on its own, and nothing lit.
              *
