@@ -152,9 +152,17 @@ static int read_temp(int patience)
 
 /* Cumulative steps from the DA217 at 2-0026, or -1.
  *
- * 0x0e and 0x0f, little endian. Found by dumping the map, walking, dumping again and taking the
- * pair that moved by about the number of steps taken - the same way the wear bit was found, and
- * for the same reason: three earlier answers here came from reading code instead of the part.
+ * 0x0d is the high byte and 0x0e the low one.
+ *
+ * This was found by dumping the map, walking, and taking what moved by about the number of steps
+ * taken - and that method got it half wrong. Only the low byte moves over a short walk, so
+ * 0x0e/0x0f little endian tracked the change exactly as well as the truth did and was believed.
+ * 0x0f is the range setting, not a count: the total it produced was 458 where the part held 9674,
+ * and it would have jumped backwards the first time 0x0e wrapped, since 0x0d is what carries.
+ *
+ * The datasheet register map in github.com/gaupen1186/DA217_Driver settles it - STEPS_MSB 0x0d,
+ * STEPS_LSB 0x0e, RES_RANGE 0x0f. A differential test cannot tell a counter from its neighbour
+ * when only one byte is moving; something that knows the map has to.
  *
  * I2C_SLAVE_FORCE because the da217 driver holds the address, so the polite ioctl is refused.
  * This only ever reads, and the driver is not producing anything to disturb.
@@ -162,19 +170,25 @@ static int read_temp(int patience)
 #define I2C_SLAVE_FORCE 0x0706
 #define DA217_ADDR      0x26
 #define DA217_BUS       "/dev/i2c-2"
-#define DA217_STEPS_LO  0x0e
+#define DA217_STEPS_MSB 0x0d
+#define DA217_STEPS_LSB 0x0e
 
 static int read_steps(void)
 {
-    unsigned char reg = DA217_STEPS_LO, v[2];
+    unsigned char msb = DA217_STEPS_MSB, lsb = DA217_STEPS_LSB, hi = 0, lo = 0;
     int fd, ok = -1;
 
     fd = open(DA217_BUS, O_RDWR);
     if (fd < 0) return -1;
     if (ioctl(fd, I2C_SLAVE_FORCE, DA217_ADDR) >= 0
-        && write(fd, &reg, 1) == 1
-        && read(fd, v, 2) == 2) {
-        ok = v[0] | (v[1] << 8);
+        && write(fd, &msb, 1) == 1 && read(fd, &hi, 1) == 1
+        && write(fd, &lsb, 1) == 1 && read(fd, &lo, 1) == 1) {
+        unsigned char hi2 = 0;
+        /* Re-read the high byte: the two are read separately, so a carry landing between them
+         * would pair an old high byte with a wrapped low one and report a count 255 too low.
+         * If it moved, the low byte belongs to the new high byte and is small. */
+        if (write(fd, &msb, 1) == 1 && read(fd, &hi2, 1) == 1 && hi2 != hi) hi = hi2;
+        ok = (hi << 8) | lo;
     }
     close(fd);
     return ok;
@@ -783,7 +797,7 @@ int main(void)
              * The launcher registers for the counter both ways the framework offers, a listener
              * and a trigger, and has never had a number out of either - its input device is
              * enabled and delivered nothing across twenty-five seconds of walking. The chip is
-             * counting perfectly well underneath that: a DA217 at 2-0026, whose 0x0e/0x0f pair
+             * counting perfectly well underneath that: a DA217 at 2-0026, whose 0x0d/0x0e count
              * rose by 21 over a thirty second walk and holds steady when the wrist is still.
              *
              * So the driver is where it stops. Reading the part directly needs root and the
