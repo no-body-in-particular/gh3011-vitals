@@ -501,8 +501,9 @@ static int level_usable(double dc_minus_dark)
  */
 /* R over a record, as the median of the sub-windows it splits into.
  *
- * One ratio over one pass takes whatever happened during it. Eight seconds of a resting wrist
- * gave channel 1 amplitudes of 13, 16, 46 and 105 counts on consecutive runs - a factor of eight
+ * One ratio over one pass takes whatever happened during it. Eight seconds of a resting wrist -
+ * the length of this pass when this was measured, twenty-five since - gave channel 1 amplitudes
+ * of 13, 16, 46 and 105 counts on consecutive runs - a factor of eight
  * from contact and small movements, not from anything in the blood - and a single R inherits all
  * of it. Measured that way R came back between 0.26 and 1.0 on a wearer who never moved.
  *
@@ -1548,8 +1549,8 @@ int main(int argc, char **argv)
      * long pass that follows runs unbalanced for the rate and the shape. Neither has to be
      * compromised for the other.
      *
-     * Eight seconds is too short to settle a heart rate by window agreement, and this does not
-     * try: the amplitude is taken at the strongest cardiac frequency found on the better channel
+     * The short pass does not try to settle a heart rate by window agreement: the amplitude is
+     * taken at the strongest cardiac frequency found on the better channel
      * and then measured at that same frequency on both. One frequency for both channels is the
      * point - taking each channel's own best would let them lock onto different things and the
      * ratio would compare two unrelated numbers.
@@ -1557,15 +1558,15 @@ int main(int argc, char **argv)
     /*
      * Re-read a kept ratio pass at a rate measured afterwards.
      *
-     * The short pass cannot settle a heart rate: eight seconds of a wandering pulse gave 41, 45,
-     * 49 and 59 bpm on four consecutive runs of a resting wrist, and R measured at the wrong
-     * frequency is R measured on noise. The long pass that follows settles the rate properly by
-     * window agreement, but by then the balanced samples are gone.
+     * The short pass cannot settle a heart rate: a wandering pulse gave 41, 45, 49 and 59 bpm on
+     * four consecutive runs of a resting wrist, measured while the pass ran for eight seconds, and
+     * R measured at the wrong frequency is R measured on noise. The long pass that follows settles
+     * the rate properly by window agreement, but by then the balanced samples are gone.
      *
      * So keep them. The short pass writes what it collected, the long pass finds the rate, and
      * then this reads the samples back and measures both channels at the rate that was actually
      * there. Nothing is re-measured on the wearer and no extra sensor time is spent - it is the
-     * same eight seconds, read once the answer is known.
+     * same twenty-five seconds, read once the answer is known.
      */
 
     if (want_redo) {

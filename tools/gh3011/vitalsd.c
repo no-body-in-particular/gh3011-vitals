@@ -42,7 +42,8 @@
  * /dev/gh_tools to itself, and a daemon holding that open cannot also hand it to a measurement. */
 #define ADTHELPER "/data/local/tmp/adtwear"
 #define SECS_HR   "40"   /* green is 25 Hz: it needs the time to fill enough windows */
-#define SECS_SPO2 "45"   /* red is 100 Hz - 2500 samples in 25 s is plenty */
+#define SECS_SPO2 "45"   /* red is 100 Hz - 4,500 samples, plenty for the
+                          * windows and for the beat the shape is built on */
 /* The balanced pass. The vendor spends about eight seconds here and we did too, but eight is
  * not enough on this sensor: four runs at 8 s gave R of 1.048, 0.907, 0.751 and 0.782, and the
  * same wrist at 25 s gave 0.877, 0.841 and 0.741 - half the spread. The extra seventeen seconds
@@ -430,7 +431,8 @@ static void measure(const char *mode, char *out, size_t outsz)
      * balanced state found no usable beats at all.
      *
      * So the short pass runs balanced and reports only R, and the long pass runs as before. The
-     * ratio costs eight seconds on top of the forty, which is what the vendor spends too.
+     * ratio costs twenty-five seconds on top of the forty-five. The vendor spends about eight
+     * here and we did too; SECS_RATIO records why ours is no longer eight.
      */
     if (strcmp(mode, "spo2") == 0) {
         char rline[256];
@@ -439,7 +441,7 @@ static void measure(const char *mode, char *out, size_t outsz)
          *
          * The re-read takes whatever is at KEEP, and nothing said whose it was. Two consecutive
          * measurements reported a ratio of 1.899 with a spread of 0.259 and amplitudes matching
-         * to three decimals - not a steady wearer, the same eight seconds counted twice. Any
+         * to three decimals - not a steady wearer, the same pass counted twice. Any
          * apparent agreement between neighbouring measurements has to be suspected wherever this
          * could have happened. */
         unlink(KEEP);
@@ -458,8 +460,9 @@ static void measure(const char *mode, char *out, size_t outsz)
         /* Carried on the reply so the ratio can be watched while it is being made to behave.
          * No saturation is derived from it: across four consecutive resting passes it came back
          * 1.40, 0.84, 0.84 and 1.13, and the frequency it was measured at wandered between 41
-         * and 59 bpm, which is eight seconds being too short to lock a rate rather than anything
-         * about the wearer. See docs/vitals.md. */
+         * and 59 bpm, which was the pass being too short to lock a rate rather than anything
+         * about the wearer. Measured while it ran for eight seconds, before SECS_RATIO went to
+         * twenty-five; the rate still comes from the long pass either way. See docs/vitals.md. */
         if (rline[0]) {
             size_t at = strlen(rline);
             while (at > 0 && (rline[at-1] == 0x0a || rline[at-1] == 0x0d)) rline[--at] = 0;
@@ -528,11 +531,13 @@ static void measure(const char *mode, char *out, size_t outsz)
 
     /* Now that the rate is known, read the short pass again at it.
      *
-     * The eight seconds could not settle a rate of their own - four consecutive runs on a
-     * resting wrist put it at 41, 45, 49 and 59 bpm - and a ratio measured at the wrong
-     * frequency is a ratio measured on noise. The long pass settles it properly by window
-     * agreement, so the samples kept from the short one are read back at that. No extra sensor
-     * time: the same eight seconds, understood once there is something to understand them with.
+     * The short pass could not settle a rate of its own - four consecutive runs on a resting
+     * wrist put it at 41, 45, 49 and 59 bpm, measured while it ran for eight seconds - and a
+     * ratio measured at the wrong frequency is a ratio measured on noise. Whether twenty-five
+     * seconds would now settle one has not been tested, and does not need to be: the long pass
+     * settles it properly by window agreement, so the samples kept from the short one are read
+     * back at that. No extra sensor time: the same twenty-five seconds, understood once there is
+     * something to understand them with.
      */
     {
         const char *at = strstr(out, "hr=");
