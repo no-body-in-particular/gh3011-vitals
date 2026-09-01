@@ -882,6 +882,11 @@ int main(void)
             } else {
                 double sx = 0, sy = 0, sz = 0, smag = 0, smagsq = 0, senmo = 0;
                 double lo = 1e9, hi = -1e9;
+                /* The magnitudes are kept, not just summed, because the caller wants a mean
+                 * absolute deviation and that cannot be recovered from the sums the way a
+                 * standard deviation can - it needs the mean before it can measure against it. */
+                static double mags[400];
+                double mean = 0, mad = 0;
                 int n = 0, ticks;
 
                 if (ms > 20000) ms = 20000;
@@ -895,17 +900,25 @@ int main(void)
                     senmo += mag > 1.0 ? mag - 1.0 : 0.0;
                     if (mag < lo) lo = mag;
                     if (mag > hi) hi = mag;
+                    if (n < (int)(sizeof mags / sizeof mags[0])) mags[n] = mag;
                     n++;
                     usleep(62000);
                 }
                 close(afd);
                 if (n == 0)
                     snprintf(reply, sizeof reply, "n=0 reason=read_failed\n");
-                else
+                else {
+                    int k, kept = n < (int)(sizeof mags / sizeof mags[0])
+                            ? n : (int)(sizeof mags / sizeof mags[0]);
+                    mean = smag / n;
+                    for (k = 0; k < kept; k++)
+                        mad += mags[k] > mean ? mags[k] - mean : mean - mags[k];
+                    if (kept) mad /= kept;
                     snprintf(reply, sizeof reply,
                              "n=%d sx=%.4f sy=%.4f sz=%.4f smag=%.4f smagsq=%.4f senmo=%.4f"
-                             " minmag=%.4f maxmag=%.4f\n",
-                             n, sx, sy, sz, smag, smagsq, senmo, lo, hi);
+                             " minmag=%.4f maxmag=%.4f mad=%.5f\n",
+                             n, sx, sy, sz, smag, smagsq, senmo, lo, hi, mad);
+                }
             }
             logline("accel", reply);
         } else if (strcmp(req, "steps") == 0) {
