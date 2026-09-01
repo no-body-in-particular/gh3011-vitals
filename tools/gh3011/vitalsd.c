@@ -742,6 +742,29 @@ int main(void)
             else if (worn < 0)
                 at += snprintf(reply + at, sizeof reply - at, " reason=no_source");
             snprintf(reply + at, sizeof reply - at, "\n");
+        } else if (strcmp(req, "temp") == 0) {
+            /* The thermometer on its own, and nothing lit.
+             *
+             * "wear" already reads it, but only when the wear detector could not run - the
+             * whole point of that detector is to avoid the eight seconds this takes. So there
+             * was no way to ask for a temperature without either starting a measurement or
+             * hoping the detector had failed.
+             *
+             * The launcher wanted one for two things, and both are cheap questions that were
+             * being answered expensively: the temperature to report between measurements, and a
+             * second opinion when the detector claims the watch is off a wrist while the skin
+             * is at 34. It was reading the thermopile through the vendor's library to get them,
+             * which is the last thing that library was still being used for.
+             *
+             * A wrist and not a body: converting one to the other needs an ambient reading this
+             * device does not have, and is the caller's business either way.
+             */
+            int wt = read_temp(8);
+            if (wt > 0)
+                snprintf(reply, sizeof reply, "temp=%d.%02d\n", wt / 100, wt % 100);
+            else
+                snprintf(reply, sizeof reply, "temp=0 reason=no_source\n");
+            logline(req, reply);
         } else {
             measure(req, reply, sizeof reply);
             logline(req, reply);
