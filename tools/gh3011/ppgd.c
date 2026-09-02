@@ -1982,7 +1982,19 @@ int main(int argc, char **argv)
          * So drop to 25 Hz, write the block, and put the rate back. The values are theirs and
          * were never the problem - the order was.
          */
-        if (want_spo2 && !getenv("NOVENDORSLOTS")) {
+        /* Off unless asked for, because written here it breaks the stream.
+         *
+         * The same eight registers given as a command-line override produce a baseline swing of
+         * about a thousand, which is normal. Written here they produce forty-two thousand, every
+         * run, and no measurement survives it. The registers and their values are identical, so
+         * it is this placement rather than the configuration - and the earlier note claiming the
+         * override placement had been reproduced was wrong.
+         *
+         * VENDORSLOTS=1 turns it on for anyone continuing this. It should stay off until the
+         * swing it causes is understood, which is the thread to pull: their configuration is
+         * still the only one that has produced balanced channels on this sensor.
+         */
+        if (want_spo2 && getenv("VENDORSLOTS")) {
             wr16(0x0016, 0x051e);
             wr16(0x0100, 0xf530); wr16(0x0102, 0x4e20);
             wr16(0x0104, 0xf530); wr16(0x0106, 0x4e20);
@@ -2108,6 +2120,26 @@ int main(int argc, char **argv)
         while (left > 0 && ns < MAXS) {
             int want = left > 240 ? 240 : left;
             if (rdn(0xaaaa, buf, want) < 0) { left = 0; break; }
+            /* Every three-byte sample, before anything is assumed about how they pair.
+             *
+             * The loop below takes six bytes a frame and calls them two channels. That is an
+             * assumption, and under the vendor's slot configuration it produces a baseline that
+             * swings by fifty thousand counts where a still wrist gives a hundred - which is what
+             * reading a three-slot stream two at a time would look like. RAWDUMP writes the
+             * samples out so the period can be measured instead of assumed.
+             */
+            if (getenv("RAWDUMP")) {
+                static FILE *rawf;
+                if (!rawf) rawf = fopen(getenv("RAWDUMP"), "w");
+                if (rawf) {
+                    int q;
+                    for (q = 0; q + 2 < want; q += 3)
+                        fprintf(rawf, "%u\n",
+                                ((unsigned)buf[q]<<16)|(buf[q+1]<<8)|buf[q+2]);
+                    fflush(rawf);
+                }
+            }
+
             for (k = 0; k + 5 < want && ns < MAXS; k += 6) {
                 unsigned int c1 = ((unsigned)buf[k]<<16)|(buf[k+1]<<8)|buf[k+2];
                 unsigned int c2 = ((unsigned)buf[k+3]<<16)|(buf[k+4]<<8)|buf[k+5];
