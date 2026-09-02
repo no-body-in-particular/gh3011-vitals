@@ -1909,6 +1909,40 @@ int main(int argc, char **argv)
          * unsaturated DC, so R is noise, and no shared gain can separate them. If one of these
          * registers is the per-slot LED current then raising it is the whole fix.
          */
+        /* The vendor's slots, for any saturation pass.
+         *
+         * Captured off their running daemon while it reported 98% on a wrist whose fingertip
+         * meter read 98 to 99. Their optical configuration is not ours: different slot LED
+         * selection, a different slot enable, and the LED current register off rather than up.
+         *
+         * Measured against ours on the same wrist minutes apart, five runs each: theirs found a
+         * rate and a ratio five times out of five, ours none out of three, and theirs came back
+         * with the two channels within a few counts of each other - ac1 28 against ac2 32, 18
+         * against 21 - where ours sits at six and five and calls the ratio weak.
+         *
+         * Applied here rather than inside the sequence replay, and the difference is not
+         * cosmetic: the same eight registers written up there give three failures out of
+         * three, and written here five successes out of five. The sequence commits after the
+         * replay, so anything written before that commit is still subject to whatever the
+         * rest of the replay does to it.
+         *
+         * That is a reliability fix rather than a calibration one. R still centres near 0.97
+         * where their 98% implies about 0.48, so this does not make the saturation right; it
+         * makes the measurement happen at all, which half of ours were not doing.
+         */
+        if (want_spo2 && !getenv("NOVENDORSLOTS")) {
+            wr16(0x0130, 0x0346);
+            wr16(0x0132, 0x0446);
+            wr16(0x0134, 0x0546);
+            wr16(0x0186, 0x0406);
+            wr16(0x0136, 0x0000);
+            wr16(0x0080, 0x0605);
+            wr16(0x0082, 0x01c6);
+            wr16(0x0084, 0x0023);
+            wr8(0xdddd, 0xc1);
+        }
+
+
         if (argc > 4 && argv[4][0]) {
             const char *p = argv[4];
             while (*p) {
