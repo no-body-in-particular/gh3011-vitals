@@ -483,6 +483,8 @@ static void bye(int s)
 
 /* Run one measurement and return its single line. The vendor daemon is stopped for the duration
  * and started again straight after, including on failure. */
+static char sleepline[256];
+
 static void measure(const char *mode, char *out, size_t outsz)
 {
     char cmd[256];
@@ -622,6 +624,7 @@ static void measure(const char *mode, char *out, size_t outsz)
                  strcmp(mode, "spo2") == 0 ? SECS_SPO2 : SECS_HR, wave_path,
                  strcmp(mode, "spo2") == 0 ? "spo2" : "hr");
     }
+    sleepline[0] = 0;
     p = popen(cmd, "r");
     if (p) {
         char line[512];
@@ -631,11 +634,26 @@ static void measure(const char *mode, char *out, size_t outsz)
                 strncpy(out, line, outsz - 1);
                 out[outsz - 1] = 0;
             }
+            /* And the sleep sample, from the accelerometer this measurement was watching anyway.
+             * It rides along on the reading rather than costing a wakeup of its own. */
+            if (strncmp(line, "asleep ", 7) == 0) {
+                strncpy(sleepline, line + 7, sizeof sleepline - 1);
+                sleepline[sizeof sleepline - 1] = 0;
+            }
         }
         pclose(p);
     }
 
     if (!out[0]) snprintf(out, outsz, "hr=0 reason=helper_gave_nothing\n");
+
+    /* Append the sleep sample to the reading, in place of the newline it ends with. This is how a
+     * measurement comes to record thirty to eighty seconds of continuous accelerometer where the
+     * sleep service was managing five seconds every five minutes. */
+    if (sleepline[0]) {
+        size_t at = strlen(out);
+        while (at > 0 && (out[at-1] == 0x0a || out[at-1] == 0x0d)) out[--at] = 0;
+        snprintf(out + at, outsz - at, " %s", sleepline);
+    }
 
     /* Now that the rate is known, read the short pass again at it.
      *

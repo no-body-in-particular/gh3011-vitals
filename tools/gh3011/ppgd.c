@@ -135,6 +135,22 @@ static int nmotion;
 static double accel_mag[MAXACC];
 static int naccel;
 
+/* The same samples, summed for the sleep record.
+ *
+ * A measurement already watches the accelerometer end to end for thirty to eighty seconds, and
+ * threw all of it away except a motion figure. The sleep recorder meanwhile woke the watch on its
+ * own alarm to take five seconds every five minutes - and its nights come out with almost no
+ * contiguous stillness in them, because five seconds every five minutes is not continuity.
+ *
+ * So the measurement writes the sleep sample too. What the scorer needs from a burst is the mean
+ * of each axis, from which it takes the wrist angle; that angle is a ratio, so raw counts serve as
+ * well as g and no scale factor is needed. The magnitudes are normalised by the window's own mean
+ * on the way out, which is what makes a deviation-from-1g metric self-calibrating.
+ */
+static double asum_x, asum_y, asum_z, asum_mag, asum_magsq;
+static double amag_lo = 1e18, amag_hi = -1e18;
+static long asamples;
+
 static void note_motion(void)
 {
     unsigned char b[608];
@@ -174,6 +190,21 @@ static void note_motion(void)
         double y = (short)(q[2] | (q[3] << 8));
         double z = (short)(q[4] | (q[5] << 8));
         accel_mag[naccel++] = sqrt(x * x + y * y + z * z);
+    }
+
+    /* Summed separately, and over every sample rather than the first MAXACC of them: the series
+     * above is bounded because it feeds a spectrum, and these are means. */
+    for (i = 0; i < n; i++) {
+        const unsigned char *q = b + 2 + i * 6;
+        double x = (short)(q[0] | (q[1] << 8));
+        double y = (short)(q[2] | (q[3] << 8));
+        double z = (short)(q[4] | (q[5] << 8));
+        double m = sqrt(x * x + y * y + z * z);
+        asum_x += x; asum_y += y; asum_z += z;
+        asum_mag += m; asum_magsq += m * m;
+        if (m < amag_lo) amag_lo = m;
+        if (m > amag_hi) amag_hi = m;
+        asamples++;
     }
 }
 
@@ -2592,6 +2623,41 @@ int main(int argc, char **argv)
                     * chose between them. Worth having under motion, and not the same claim as a
                     * reading the windows settled themselves. */
                    tracked ? " tracked=1" : "");
+
+            /* The sleep sample, from the accelerometer this measurement was watching anyway.
+             *
+             * Means rather than sums, and normalised so a resting wrist reads 1.0 - the window's
+             * own mean magnitude is the scale, which is what makes this independent of whatever
+             * counts-per-g this driver happens to use. The angle the scorer wants is a ratio of
+             * the axes and needs no scale at all.
+             */
+            if (asamples > 0) {
+                double mx = asum_x / asamples, my = asum_y / asamples, mz = asum_z / asamples;
+                double mm = asum_mag / asamples;
+                double var = asum_magsq / asamples - mm * mm;
+                double sd = var > 0 ? sqrt(var) : 0.0;
+                if (mm > 0) {
+                    /* A real deviation metric, not a zero.
+                     *
+                     * Normalising by the window mean makes the mean itself 1.0, so anything
+                     * derived from it alone is identically zero - and a zero in the enmo column
+                     * reads as perfect stillness, which is what the scorer takes for the soundest
+                     * sleep there is. So it is computed the way enmo is defined, per sample and
+                     * clipped at zero, over the magnitudes kept for the spectrum.
+                     */
+                    double enmo = 0.0;
+                    int k;
+                    for (k = 0; k < naccel; k++) {
+                        double u = accel_mag[k] / mm;
+                        if (u > 1.0) enmo += u - 1.0;
+                    }
+                    if (naccel > 0) enmo /= naccel;
+
+                    printf("asleep n=%ld ax=%.5f ay=%.5f az=%.5f asd=%.5f aenmo=%.5f arange=%.5f\n",
+                           asamples, mx / mm, my / mm, mz / mm, sd / mm, enmo,
+                           (amag_hi - amag_lo) / mm);
+                }
+            }
         }
     }
     return 0;
