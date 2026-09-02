@@ -357,6 +357,54 @@ static void ring_add(double r)
     if (ring_n < RING) ring_n++;
 }
 
+/* The two halves of the ratio, accumulated separately.
+ *
+ * Averaging R itself is what forces a weak pass to be thrown away, and the reason is arithmetic
+ * rather than caution. R is (ac1/l1)/(ac2/l2), and with ac2 at three to nine counts that is a
+ * ratio of small numbers: the expectation of 1/x is not 1/E[x] but biased upwards and
+ * heavy-tailed, so averaging many weak passes converges on the wrong number rather than a better
+ * one. The bias does not average away, which is why the gate has to reject them outright.
+ *
+ * Accumulating ac1/l1 and ac2/l2 separately fixes that. Each is linear in what was measured, so
+ * its mean is unbiased and its error falls as the root of the count, and the ratio of two well
+ * estimated means is well behaved where a mean of ratios is not. Ten passes carrying three counts
+ * then say as much as one carrying thirty.
+ *
+ * Legitimate across time because perfusion scales both channels together - that is the whole
+ * reason a ratio of ratios is used - so what is being averaged does not move when the pulse gets
+ * stronger or weaker. What it must not span is a change in the light, so it is dropped whenever
+ * the gain changes.
+ */
+#define ACC_MAX 32
+
+static double acc_n1[ACC_MAX], acc_n2[ACC_MAX];
+static int acc_at, acc_n;
+static unsigned acc_gain;
+
+static void acc_add(double perf1, double perf2, unsigned gain)
+{
+    if (perf1 <= 0.0 || perf2 <= 0.0) return;
+    if (gain != acc_gain) { acc_at = 0; acc_n = 0; acc_gain = gain; }
+    acc_n1[acc_at] = perf1;
+    acc_n2[acc_at] = perf2;
+    acc_at = (acc_at + 1) % ACC_MAX;
+    if (acc_n < ACC_MAX) acc_n++;
+}
+
+/* The ratio of the means, and the total pulse behind it. */
+static int acc_ratio(double *r_out, double *carried)
+{
+    double s1 = 0, s2 = 0;
+    int i;
+
+    if (acc_n < 3) return 0;
+    for (i = 0; i < acc_n; i++) { s1 += acc_n1[i]; s2 += acc_n2[i]; }
+    if (s2 <= 0.0) return 0;
+    *r_out = s1 / s2;
+    *carried = s2;
+    return acc_n;
+}
+
 /* Saturation, as a movement away from this sensor's own recent baseline.
  *
  * An absolute figure is not available and the reason is now understood rather than suspected. R
@@ -488,7 +536,14 @@ static char sleepline[256];
 static void measure(const char *mode, char *out, size_t outsz)
 {
     char cmd[256];
-    char ratio_out[192];
+    /* Wide enough for the pass and everything computed from it.
+ *
+     * It was 192, which the pass1 capture fills on its own - so every field appended afterwards
+     * landed past the end and was dropped without a word. rstable, spo2rel and the accumulator
+     * state all disappeared that way, and the accumulator looked like it was never running when
+     * it was running and being truncated.
+     */
+    char ratio_out[512];
     char wave_path[128];
     size_t ratio_sz = sizeof ratio_out;
     FILE *p;
@@ -835,17 +890,59 @@ static void measure(const char *mode, char *out, size_t outsz)
              * saturation that is nine minutes old is worth having where one that is wrong is
              * not.
              */
-            double rstable = 0, rspread = 0;
-            int rn = ring_view(&rstable, &rspread);
+            double d1 = field_of(ratio_out, "dc1=");
+            double d2 = field_of(ratio_out, "dc2=");
+            double racc = 0, carried = 0;
+            int an = 0;
 
-            if (a1 >= 7.5 && a2 >= 30.0 && rn >= 3 && rstable > 0.05 && rstable < 5.0
-                && beats >= 8 && rsp >= 0 && rsp < 0.35) {
-                double abs_sat = 110.0 - 25.0 * rstable;
+            /* Every pass that measured something goes in, however small - see acc_add. The
+             * quality gates still apply, because a pass that did not hold still is wrong rather
+             * than merely quiet, but the amplitude no longer has to be large on its own. */
+            /* A looser spread than the single-pass path asks for.
+             *
+             * 0.35 is how far the sub-windows of one pass may disagree before that pass is
+             * converted on its own, and it is the right number for that: nothing else will catch
+             * a pass that did not hold still. Averaging across passes does catch it, and the
+             * measured spreads sit right on the line - 0.349 on the run this was written against -
+             * so the strict gate admits almost nothing to accumulate.
+             *
+             * Half is still tight enough to exclude a pass that was measuring an arm rather than
+             * a pulse, which is a bias and does not average away.
+             */
+            if (d1 > 0 && d2 > 0 && a1 > 0 && a2 > 0
+                && beats >= 8 && rsp >= 0 && rsp < 0.50) {
+                double l1 = d1 - floor(d1 / 1048576.0) * 1048576.0;
+                double l2 = d2 - floor(d2 / 1048576.0) * 1048576.0;
+
+                if (l1 > 100.0 && l2 > 100.0)
+                    acc_add(a1 / l1, a2 / l2, (unsigned)field_of(out, "gain="));
+            }
+            an = acc_ratio(&racc, &carried);
+
+            /* Say where the accumulator has got to whether or not it can answer yet. It fills
+             * over many passes, and an accumulator that reports nothing until it succeeds cannot
+             * be told apart from one that is not filling at all. */
+            {
+                size_t at5 = strlen(ratio_out);
+                snprintf(ratio_out + at5, ratio_sz - at5, " accn=%d accpulse=%.5f",
+                         acc_n, carried);
+            }
+
+            /* Enough pulse in total, rather than enough in one pass.
+             *
+             * The old test wanted ac2 of thirty in the pass being converted, which on this wrist
+             * is a minority of them. The accumulator asks for the same amount of signal summed
+             * over however many passes it takes: thirty counts against a level of twenty-five
+             * thousand is a perfusion index of 0.0012, and ten passes carrying three counts reach
+             * it together.
+             */
+            if (an >= 3 && carried >= 0.0012 && racc > 0.05 && racc < 5.0) {
+                double abs_sat = 110.0 - 25.0 * racc;
 
                 if (abs_sat >= 70.0 && abs_sat <= 100.0) {
                     size_t at4 = strlen(ratio_out);
                     snprintf(ratio_out + at4, ratio_sz - at4,
-                             " spo2abs=%.0f spo2n=%d spo2spread=%.3f", abs_sat, rn, rspread);
+                             " spo2abs=%.0f spo2n=%d spo2pulse=%.5f", abs_sat, an, carried);
                 }
             }
         }
@@ -892,7 +989,9 @@ int main(void)
     fprintf(stderr, "vitalsd: listening on abstract socket \"%s\"\n", SOCKNAME);
 
     for (;;) {
-        char req[64], reply[512];
+        /* The reply carries the reading and the pass behind it; 512 truncated the
+         * second half of a spo2 answer. */
+        char req[64], reply[1024];
         int c = accept(listenfd, NULL, NULL);
         ssize_t n;
         if (c < 0) {
