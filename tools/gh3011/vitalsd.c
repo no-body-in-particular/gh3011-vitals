@@ -914,8 +914,12 @@ static void measure(const char *mode, char *out, size_t outsz)
                 double l1 = d1 - floor(d1 / 1048576.0) * 1048576.0;
                 double l2 = d2 - floor(d2 / 1048576.0) * 1048576.0;
 
-                if (l1 > 100.0 && l2 > 100.0)
-                    acc_add(a1 / l1, a2 / l2, (unsigned)field_of(out, "gain="));
+                /* Not fed from here any more. The ratio pass runs at a different gain from the
+                 * long one - 2828 against 2323 - and acc_add drops everything when the gain
+                 * changes, so feeding both passes reset the accumulator on every request and it
+                 * never reached the three entries it needs. The long pass has four times the
+                 * samples anyway. */
+                (void) l1; (void) l2;
             }
             an = acc_ratio(&racc, &carried);
 
@@ -954,9 +958,48 @@ static void measure(const char *mode, char *out, size_t outsz)
              * Kept behind an environment variable so the work can be measured against a meter
              * without being displayed to anyone in the meantime.
              */
+            /* Calibrated, and only the offset is.
+             *
+             * Their curve is 110 - 25R, read out of gh3011_service. On a freshly rebooted watch
+             * this sensor gives R = 0.713 with a spread of 0.12 across six measurements, which
+             * that curve turns into 92% while a fingertip meter and their own daemon both say 98.
+             * So the intercept moves: 98 + 25 * 0.713 is 115.8, and 116 - 25R reads 98.2 at the
+             * ratio this wrist actually produces.
+             *
+             * The slope is theirs and is not verified. One anchor fixes where the curve sits and
+             * says nothing about its steepness, and nothing here has ever measured a desaturation
+             * - breath-holding does not move a healthy adult below 96. So a fall of a few points
+             * is worth seeing and its size is the textbook slope's claim rather than this
+             * sensor's.
+             *
+             * The spread carries into the reading: 0.12 of ratio is three points of saturation,
+             * so this is a number plus or minus three, and spo2spread says so on every line.
+             *
+             * Everything that made the earlier 86% wrong is still guarded against. It is built
+             * from the ratio accumulated across passes rather than one; it needs the amplitude
+             * gate, the beat count and the window spread; and the calibration behind it was taken
+             * on a rebooted chip, because a degraded one gave 0.94 for the same wrist an hour
+             * before it gave 0.71.
+             */
+            /* Not published. Calibrated, deployed, and still wrong.
+             *
+             * 116 - 25R was fitted to R = 0.713, the ratio a rebooted chip gives across six
+             * measurements. Running, it published 94, 90, 90 and 91 against a meter reading 98 to
+             * 99 - so the accumulated ratio is landing near 0.9 to 1.0 while the single passes
+             * feeding it read 0.729 and 0.748. The accumulator weights by pulse, so a pass with a
+             * large amplitude and a poor ratio outvotes several good ones.
+             *
+             * Closer than the 86% this file already records and still five to eight points low,
+             * which is the difference between a healthy reading and one somebody acts on. So it
+             * stays behind SPO2ABS until the accumulated ratio matches the passes going into it.
+             *
+             * The calibration itself is probably sound: the offset was measured against a
+             * reference on a clean chip, and 116 - 25 * 0.713 is 98.2. It is the averaging in
+             * front of it that is wrong, not the number.
+             */
             if (getenv("SPO2ABS") && an >= 3 && carried >= 0.0012
                 && racc > 0.05 && racc < 5.0) {
-                double abs_sat = 110.0 - 25.0 * racc;
+                double abs_sat = 116.0 - 25.0 * racc;
 
                 if (abs_sat >= 70.0 && abs_sat <= 100.0) {
                     size_t at4 = strlen(ratio_out);
@@ -968,6 +1011,29 @@ static void measure(const char *mode, char *out, size_t outsz)
     }
 
     /* The short pass rides along on the same line. */
+    /* The main pass feeds the accumulator too.
+     *
+     * It only ever fed from the short ratio pass, which fails far more often than the long one -
+     * accn sat at one through nine requests while the main pass was returning ratios of 0.69 to
+     * 0.79 on the same wrist. A ratio is a ratio whichever pass measured it, and the long pass
+     * has four times the samples behind it.
+     */
+    {
+        double ma1 = field_of(out, "ac1=");
+        double ma2 = field_of(out, "ac2=");
+        double md1 = field_of(out, "dc1=");
+        double md2 = field_of(out, "dc2=");
+        double mr  = field_of(out, " r=");
+
+        if (ma1 > 0 && ma2 > 0 && md1 > 0 && md2 > 0 && mr > 0.05 && mr < 5.0) {
+            double ml1 = md1 - floor(md1 / 1048576.0) * 1048576.0;
+            double ml2 = md2 - floor(md2 / 1048576.0) * 1048576.0;
+
+            if (ml1 > 100.0 && ml2 > 100.0)
+                acc_add(ma1 / ml1, ma2 / ml2, (unsigned)field_of(out, "gain="));
+        }
+    }
+
     if (ratio_out[0]) {
         size_t at = strlen(out);
         while (at > 0 && (out[at-1] == 0x0a || out[at-1] == 0x0d)) out[--at] = 0;
