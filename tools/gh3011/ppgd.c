@@ -333,6 +333,10 @@ static double bin_amp(const unsigned int *x, int n, double dc, double fs, double
  * required to stay in phase with each other. Each window has its own mean removed, so a baseline
  * that drifts across the record does not leak into any of them.
  */
+/* The ratio window by window, for calibrating against a reference that moves. */
+static double series_at[128], series_r[128];
+static int nseries;
+
 static double band_amp(const unsigned int *x, int n, double fs, double f)
 {
     int w = (int)(fs * 6.0), step, i, k, nw = 0;
@@ -571,6 +575,19 @@ static int ratio_windows(const unsigned int *a, const unsigned int *b, int n, do
         x1 = band_amp(a + i, w, fs, bpm / 60.0);
         x2 = band_amp(b + i, w, fs, bpm / 60.0);
         if (x1 <= 0 || x2 <= 0) continue;
+        /* Keep when as well as what.
+         *
+         * The median of these is what a reading reports, and for a saturation that is the wrong
+         * reduction to have made: a desaturation is a movement, and a single number averaged over
+         * forty seconds cannot be lined up against a reference that swept from 98 to 92 and back
+         * inside the same window. Calibrating needs pairs, so the series is kept with the time
+         * each window started.
+         */
+        if (nseries < 128) {
+            series_at[nseries] = i / fs;
+            series_r[nseries] = (x1 / l1) / (x2 / l2);
+            nseries++;
+        }
         rs[nr++] = (x1 / l1) / (x2 / l2);
     }
     if (nr < 3) return 0;
@@ -2631,6 +2648,14 @@ int main(int argc, char **argv)
              * counts-per-g this driver happens to use. The angle the scorer wants is a ratio of
              * the axes and needs no scale at all.
              */
+            if (getenv("RSERIES") && nseries > 0) {
+                int k;
+                printf("rseries n=%d", nseries);
+                for (k = 0; k < nseries; k++)
+                    printf(" %.1f:%.4f", series_at[k], series_r[k]);
+                printf("\n");
+            }
+
             if (asamples > 0) {
                 double mx = asum_x / asamples, my = asum_y / asamples, mz = asum_z / asamples;
                 double mm = asum_mag / asamples;
