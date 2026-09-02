@@ -819,13 +819,33 @@ static void measure(const char *mode, char *out, size_t outsz)
             double a1 = field_of(ratio_out, "ac1=");
             double a2 = field_of(ratio_out, "ac2=");
 
-            if (a1 >= 7.5 && a2 >= 30.0 && rm > 0.05 && rm < 5.0
+            /* From the ring, not from this pass.
+             *
+             * The vendor does not convert a single pass either. FUN_000210f8 copies the last N
+             * entries of a ring buffer - the ratios as floats and a quality byte each - and
+             * FUN_00020040 takes the mean of the ratios weighted by those bytes. Their curve is
+             * applied to that, not to one measurement.
+             *
+             * It is the right shape for this signal. The quantisation that moves R about is
+             * independent between passes, so it averages down where the perfusion it rides on
+             * does not. ring_view already holds the median and spread across passes and was only
+             * being reported; this uses it.
+             *
+             * Three passes minimum, which at the current cadence is about nine minutes. A
+             * saturation that is nine minutes old is worth having where one that is wrong is
+             * not.
+             */
+            double rstable = 0, rspread = 0;
+            int rn = ring_view(&rstable, &rspread);
+
+            if (a1 >= 7.5 && a2 >= 30.0 && rn >= 3 && rstable > 0.05 && rstable < 5.0
                 && beats >= 8 && rsp >= 0 && rsp < 0.35) {
-                double abs_sat = 110.0 - 25.0 * rm;
+                double abs_sat = 110.0 - 25.0 * rstable;
 
                 if (abs_sat >= 70.0 && abs_sat <= 100.0) {
                     size_t at4 = strlen(ratio_out);
-                    snprintf(ratio_out + at4, ratio_sz - at4, " spo2=%.0f", abs_sat);
+                    snprintf(ratio_out + at4, ratio_sz - at4,
+                             " spo2=%.0f spo2n=%d spo2spread=%.3f", abs_sat, rn, rspread);
                 }
             }
         }
