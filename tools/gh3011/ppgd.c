@@ -1930,6 +1930,69 @@ int main(int argc, char **argv)
          * where their 98% implies about 0.48, so this does not make the saturation right; it
          * makes the measurement happen at all, which half of ours were not doing.
          */
+        /* 0x0100 is the one register that still differs, and rewriting it made things worse.
+         *
+         * Diffing their running chip against ours, fifty-six of fifty-seven registers matched.
+         * The exception is 0x0100: f530 for them, ea60 for us - exactly 60000, so the part is
+         * clamping what we write. It clamps against the sample rate, and their sequence writes
+         * the whole 0x0100 block before setting 0x0016 to 0147 where ours is already there.
+         *
+         * Dropping to 25 Hz, writing their block and putting the rate back was tried and taken
+         * out again. It failed four measurements out of four - and so did the build without it,
+         * three out of three, a minute later. So it is not established that it made anything
+         * worse; the wrist stopped giving a pulse and neither version could be judged. Removed
+         * because an unproven change is not worth carrying, not because it was shown to hurt.
+         *
+         * Whether the write sticks could not be established either: 0x0100 and 0x0016 both read
+         * back as 30d4, which is 0x0116's value, on the bus this file keeps warning about.
+         *
+         * So the difference is known and the fix is not. It is one register out of fifty-seven,
+         * and worth returning to with a way of confirming a write that does not depend on reading
+         * it back.
+         */
+        /* The vendor's slots, for any saturation pass.
+         *
+         * Captured off their running daemon while it reported 98% on a wrist whose fingertip
+         * meter read 98 to 99. Their optical configuration is not ours: different slot LED
+         * selection, a different slot enable, and the LED current register off rather than up.
+         *
+         * Measured against ours on the same wrist minutes apart, five runs each: theirs found a
+         * rate and a ratio five times out of five, ours none out of three, and theirs came back
+         * with the two channels within a few counts of each other - ac1 28 against ac2 32, 18
+         * against 21 - where ours sits at six and five and calls the ratio weak.
+         *
+         * Applied here rather than inside the sequence replay, and the difference is not
+         * cosmetic: the same eight registers written up there give three failures out of
+         * three, and written here five successes out of five. The sequence commits after the
+         * replay, so anything written before that commit is still subject to whatever the
+         * rest of the replay does to it.
+         *
+         * That is a reliability fix rather than a calibration one. R still centres near 0.97
+         * where their 98% implies about 0.48, so this does not make the saturation right; it
+         * makes the measurement happen at all, which half of ours were not doing.
+         */
+        /* Their 0x0100 block, written at the rate it was captured at.
+         *
+         * Diffing their running chip against ours, every register matched but one: 0x0100 holds
+         * f530 for them and ea60 for us - exactly 60000, so the part is clamping what we write.
+         * It clamps against the sample rate, and the rate is what differs when the write lands.
+         * Their sequence writes the whole 0x0100 block first and only then sets 0x0016 to 0147;
+         * ours is already at 0147 from the previous pass, so the same value will not fit.
+         *
+         * So drop to 25 Hz, write the block, and put the rate back. The values are theirs and
+         * were never the problem - the order was.
+         */
+        if (want_spo2 && !getenv("NOVENDORSLOTS")) {
+            wr16(0x0016, 0x051e);
+            wr16(0x0100, 0xf530); wr16(0x0102, 0x4e20);
+            wr16(0x0104, 0xf530); wr16(0x0106, 0x4e20);
+            wr16(0x0108, 0xf530); wr16(0x010a, 0x2710);
+            wr16(0x010c, 0xf148); wr16(0x010e, 0x57e4);
+            wr16(0x0110, 0xf148); wr16(0x0112, 0x57e4);
+            wr16(0x0114, 0xf148); wr16(0x0116, 0x30d4);
+            wr16(0x0016, 0x0147);
+        }
+
         if (want_spo2 && !getenv("NOVENDORSLOTS")) {
             wr16(0x0130, 0x0346);
             wr16(0x0132, 0x0446);
