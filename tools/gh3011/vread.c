@@ -52,6 +52,7 @@
 #define XFER  0xc0084704u
 #define PWR   0x40044702u
 #define WAIT  0x00004701u
+#define MODERD 0xc0044708u       /* _IOWR('G',8,4) - the first call their daemon makes */
 #define IRQEN 0x40044707u        /* interrupt enable, 1 or 0 */
 #define MODE  0x40184709u        /* 24 bytes; the vendor calls it right after the start */
 #define BULK  0x825a470au        /* _IOR('G', 0x0a, 602) - the vendor's sample read */
@@ -179,8 +180,33 @@ int main(int argc, char **argv)
     fd = open(DEV, O_RDWR);
     if (fd < 0) { printf("cannot open %s\n", DEV); return 1; }
 
-    ioctl(fd, PWR, &on);
-    usleep(50000);
+    /* Their first call is 0xc0044708 and this does not make it, deliberately.
+     *
+     * It was the one call in their sequence missing from ours, traced with the same tap and
+     * diffed, so it looked like the answer. It blocks - a probe that makes it hangs until it is
+     * killed. That is not a status read, it is how their daemon waits for work: it sits in this
+     * call until an app asks for a mode, which is why it idles until com.ic.work runs and why the
+     * saturation only appeared once that service was started.
+     *
+     * Useful to know and not the missing piece. Nothing here has anyone to wait for.
+     */
+    /* Off, then on. The transition is the point, not the final state.
+     *
+     * Their trace stops the part, reads 0x0016 back as 0000 - the chip is off - and only then
+     * powers it, and the very next thing is an interrupt carrying status 0x0020, a chip reset.
+     * Powering on a part that is already on is a no-op, which is what this was doing: the chip
+     * stays up between our runs, so there was never a transition and never a reset to announce.
+     * That is the most likely reason our interrupt has never arrived and theirs always does.
+     */
+    {
+        int off = 0;
+        cmd(0xc4);
+        ioctl(fd, PWR, &off);
+        usleep(200000);
+        ioctl(fd, PWR, &on);
+        usleep(50000);
+        printf("power cycled\n");
+    }
 
     if (rd16(0x0028, &v) < 0 || v != 0x0031) {
         printf("chip id reads %04x, not 0031 - the bus is not returning registers\n", v);
@@ -211,6 +237,16 @@ int main(int argc, char **argv)
 
     /* The command between their start and their first read. We had c0, c1, c3 and c4; this one
      * appears once, there, and nowhere else in the capture. */
+    /* The interrupt mask, from Goodix's own example configuration.
+     *
+     * gh3011_example_reg_array.c carries {0x2A00, 0x00FF} in its saturation array. 0x2a00 is the
+     * value this project decided was not a register at all: it sits one past the end of the
+     * auto-detect table and the table was truncated there on the grounds that the address looked
+     * wrong. If it is an interrupt enable with every bit set, that truncation is why nothing has
+     * ever delivered an interrupt here.
+     */
+    wr16(0x2a00, 0x00ff);
+
     cmd(0xa1);
 
     /* Announce the mode, which the vendor does immediately after starting and which we have only
