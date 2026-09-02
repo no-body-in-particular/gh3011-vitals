@@ -829,7 +829,14 @@ static void measure(const char *mode, char *out, size_t outsz)
         double rsp = field_of(ratio_out, "spread=");
         if (rm > 0.05 && rm < 5.0 && beats >= 8 && rb > 0 && rsp >= 0 && rsp < 0.35) {
             double hi = rm > rb ? rm : rb, lo = rm > rb ? rb : rm;
-            if (lo > 0 && hi / lo < 1.6) ring_add(rm);
+            /* Not added here any more.
+             *
+             * rm is rmatch from the ratio pass and reads about 1.87; the long pass contributes a
+             * ratio of about 0.70. They are different quantities and this ring held both, so its
+             * median wandered between them as the mix changed - rstable went 0.700, 1.878, 1.866
+             * across three consecutive requests, and the saturation built on it moved with it.
+             * One ring, one quantity. */
+            if (lo > 0 && hi / lo < 1.6) { /* see above */ }
         }
         n3 = ring_view(&med, &sp);
         if (n3 >= 3) {
@@ -997,14 +1004,37 @@ static void measure(const char *mode, char *out, size_t outsz)
              * reference on a clean chip, and 116 - 25 * 0.713 is 98.2. It is the averaging in
              * front of it that is wrong, not the number.
              */
-            if (getenv("SPO2ABS") && an >= 3 && carried >= 0.0012
+            /* Published, from the median of the passes.
+             *
+             * The offset is measured: a rebooted chip gives R = 0.713 across six measurements,
+             * their curve makes that 92%, and a fingertip meter and their own daemon both say 98,
+             * so the intercept moves from 110 to 116. Only the offset - one anchor says nothing
+             * about the slope, and no desaturation has ever been measured here, so a fall is
+             * worth seeing and its size is the textbook slope's claim rather than this sensor's.
+             *
+             * From the median rather than the pulse-weighted mean, which is what made the first
+             * calibrated attempt publish 90 while the passes feeding it read 0.73: the
+             * accumulator lets one large-amplitude pass with a poor ratio outvote several good
+             * ones, and a median cannot be dragged that way.
+             *
+             * Three passes minimum and the amplitude gate still applies, so it appears when there
+             * is enough pulse behind it and not otherwise. spo2r and spo2spread carry the ratio
+             * and the disagreement between passes, because 0.12 of spread is three points of
+             * saturation and a reading of 98 plus or minus 3 should say so.
+             */
+            if (an >= 3 && carried >= 0.0012
                 && racc > 0.05 && racc < 5.0) {
-                double abs_sat = 116.0 - 25.0 * racc;
+                /* The median of the passes, not their pulse-weighted mean. See ring_add above. */
+                double med_r = 0, med_spread = 0;
+                int med_n = ring_view(&med_r, &med_spread);
+                double abs_sat = 116.0 - 25.0 * (med_n >= 3 ? med_r : racc);
 
                 if (abs_sat >= 70.0 && abs_sat <= 100.0) {
                     size_t at4 = strlen(ratio_out);
                     snprintf(ratio_out + at4, ratio_sz - at4,
-                             " spo2abs=%.0f spo2n=%d spo2pulse=%.5f", abs_sat, an, carried);
+                             " spo2abs=%.0f spo2n=%d spo2r=%.3f spo2spread=%.3f",
+                             abs_sat, med_n >= 3 ? med_n : an,
+                             med_n >= 3 ? med_r : racc, med_spread);
                 }
             }
         }
@@ -1029,8 +1059,14 @@ static void measure(const char *mode, char *out, size_t outsz)
             double ml1 = md1 - floor(md1 / 1048576.0) * 1048576.0;
             double ml2 = md2 - floor(md2 / 1048576.0) * 1048576.0;
 
-            if (ml1 > 100.0 && ml2 > 100.0)
+            if (ml1 > 100.0 && ml2 > 100.0) {
                 acc_add(ma1 / ml1, ma2 / ml2, (unsigned)field_of(out, "gain="));
+                /* And the ratio itself, for the median. The accumulator weights by pulse, which
+                 * lets one large-amplitude pass with a poor ratio outvote several good ones - it
+                 * published 90 while the passes feeding it read 0.73. A median cannot be dragged
+                 * that way. */
+                ring_add(mr);
+            }
         }
     }
 
