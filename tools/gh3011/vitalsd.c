@@ -792,6 +792,43 @@ static void measure(const char *mode, char *out, size_t outsz)
                 snprintf(ratio_out + at3, ratio_sz - at3, " spo2rel=%.0f", sat);
             }
         }
+
+        /* And the vendor's own curve, where the pulse is big enough to carry it.
+         *
+         * Read out of gh3011_service: FUN_00020040 evaluates coef[0x2c]*r*r + coef[0x30]*r +
+         * coef[0x34] on the ratio, and FUN_0001f8c0 fills those three with 0.0, -25.0 and 110.0.
+         * So their shipped curve is 110 - 25R with no quadratic term - the textbook empirical one,
+         * a default rather than a per-device fit, and nothing in their daemon writes over it.
+         * docs/gh3011.md has the working.
+         *
+         * The amplitude gate is the whole difference between this and a number. R is a ratio of
+         * two small differences, and at the amplitudes this sensor gives when perfusion is poor -
+         * three to nine counts - a single ADC count moves it by more than a six point
+         * desaturation does. Measured within minutes on a still wrist: ac2 of 6 and 9 gave R of
+         * 1.840 and 1.223, which this curve would report as 64% and 79%. Neither is true.
+         *
+         * ratio_usable in ppgd already draws that line at ac1 >= 7.5 and ac2 >= 30 and only
+         * labels it. Here it decides, because a saturation that is wrong is worse than one that
+         * is missing.
+         *
+         * The vendor clamps their result to a floor of 70 before reporting it, so their display
+         * cannot show what a bad ratio produces. This refuses instead: a reading below 70 from a
+         * pulse this size is not a desaturation, it is a ratio that has come apart.
+         */
+        {
+            double a1 = field_of(ratio_out, "ac1=");
+            double a2 = field_of(ratio_out, "ac2=");
+
+            if (a1 >= 7.5 && a2 >= 30.0 && rm > 0.05 && rm < 5.0
+                && beats >= 8 && rsp >= 0 && rsp < 0.35) {
+                double abs_sat = 110.0 - 25.0 * rm;
+
+                if (abs_sat >= 70.0 && abs_sat <= 100.0) {
+                    size_t at4 = strlen(ratio_out);
+                    snprintf(ratio_out + at4, ratio_sz - at4, " spo2=%.0f", abs_sat);
+                }
+            }
+        }
     }
 
     /* The short pass rides along on the same line. */
