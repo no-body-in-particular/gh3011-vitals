@@ -845,7 +845,7 @@ static void measure(const char *mode, char *out, size_t outsz)
                 if (abs_sat >= 70.0 && abs_sat <= 100.0) {
                     size_t at4 = strlen(ratio_out);
                     snprintf(ratio_out + at4, ratio_sz - at4,
-                             " spo2=%.0f spo2n=%d spo2spread=%.3f", abs_sat, rn, rspread);
+                             " spo2abs=%.0f spo2n=%d spo2spread=%.3f", abs_sat, rn, rspread);
                 }
             }
         }
