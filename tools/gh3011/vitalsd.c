@@ -936,7 +936,26 @@ static void measure(const char *mode, char *out, size_t outsz)
              * thousand is a perfusion index of 0.0012, and ten passes carrying three counts reach
              * it together.
              */
-            if (an >= 3 && carried >= 0.0012 && racc > 0.05 && racc < 5.0) {
+            /* Not published. It was, and it was wrong by twelve points in the frightening
+             * direction.
+             *
+             * With three passes accumulated and 0.005 of pulse behind them - four times what the
+             * gate asks for - the ratio came out at 0.96 and the curve turned that into 86%, on a
+             * wearer whose fingertip meter read 98 to 99 at the same time. This morning's best
+             * single pass gave 0.429 and 99% on the same wrist. The accumulator did its job:
+             * what it averaged was unstable, so it produced a steady wrong answer instead of a
+             * noisy one, which is worse. A saturation of 86 is a number somebody acts on.
+             *
+             * The arithmetic in acc_add is still right and the fault is not there. R itself moves
+             * across the physiological range on this sensor between one pass and the next, and no
+             * amount of averaging fixes an estimator whose spread is wider than the thing being
+             * measured. Until R is stable, the vendor's curve has nothing trustworthy to convert.
+             *
+             * Kept behind an environment variable so the work can be measured against a meter
+             * without being displayed to anyone in the meantime.
+             */
+            if (getenv("SPO2ABS") && an >= 3 && carried >= 0.0012
+                && racc > 0.05 && racc < 5.0) {
                 double abs_sat = 110.0 - 25.0 * racc;
 
                 if (abs_sat >= 70.0 && abs_sat <= 100.0) {
