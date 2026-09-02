@@ -1022,7 +1022,21 @@ static void measure(const char *mode, char *out, size_t outsz)
              * and the disagreement between passes, because 0.12 of spread is three points of
              * saturation and a reading of 98 plus or minus 3 should say so.
              */
-            if (an >= 3 && carried >= 0.0012
+            /* Behind SPO2ABS again, and this time the reason is understood rather than guessed.
+             *
+             * Running, it publishes 70 to 73 with a ring median of 1.7 to 1.8. Single passes run
+             * by hand on the same wrist minutes earlier read 0.585, 0.694 and 0.812 - so it is
+             * not the wrist and not the calibration. The difference is that vitalsd always runs
+             * the ratio pass first and the ratio pass writes 0x0180 to zero to balance the
+             * channels; the long pass then measures a starved channel 2 and returns a ratio twice
+             * what it should be. ac2 falls to six counts where a single pass gives 120.
+             *
+             * ppgd restores 0x0180 when it exits and that is evidently not enough - the two
+             * passes are separate processes, so the restore should apply, and the ratio it
+             * produces says it does not. That is the next thing to chase and it is a specific
+             * question rather than a search.
+             */
+            if (getenv("SPO2ABS") && an >= 3 && carried >= 0.0012
                 && racc > 0.05 && racc < 5.0) {
                 /* The median of the passes, not their pulse-weighted mean. See ring_add above. */
                 double med_r = 0, med_spread = 0;
@@ -1061,11 +1075,20 @@ static void measure(const char *mode, char *out, size_t outsz)
 
             if (ml1 > 100.0 && ml2 > 100.0) {
                 acc_add(ma1 / ml1, ma2 / ml2, (unsigned)field_of(out, "gain="));
-                /* And the ratio itself, for the median. The accumulator weights by pulse, which
-                 * lets one large-amplitude pass with a poor ratio outvote several good ones - it
-                 * published 90 while the passes feeding it read 0.73. A median cannot be dragged
-                 * that way. */
-                ring_add(mr);
+
+                /* The ratio, for the median - and only from a pass big enough to have measured
+                 * one.
+                 *
+                 * The publication gate asks for ac1 >= 7.5 and ac2 >= 30 and the ring asked for
+                 * nothing, so every pass where channel 2 collapsed to six counts went in and the
+                 * median followed them: it read 1.825 and published 70 while good passes on the
+                 * same wrist minutes earlier read 0.585 and 0.812. A median is robust to outliers
+                 * and not to a majority, and on this sensor the bad passes are the majority.
+                 *
+                 * Same threshold as the publication uses, so the ring holds exactly the passes
+                 * that would have been trusted individually.
+                 */
+                if (ma1 >= 7.5 && ma2 >= 30.0) ring_add(mr);
             }
         }
     }

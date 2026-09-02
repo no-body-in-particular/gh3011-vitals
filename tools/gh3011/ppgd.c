@@ -1864,7 +1864,15 @@ int main(int argc, char **argv)
 
         /* Balance the channels, for the ratio pass only. See the long note below on why this is
          * wrong for the pass that measures a pressure. */
-        if (want_ratio) {
+        /* NOBALANCE keeps 0x0180 as the sequence set it.
+         *
+         * Zeroing it balances the channels for the ratio pass, which is what the long note below
+         * argues for. It is also the best candidate for the drift: ac2 falls from 131 on a
+         * rebooted watch to single figures over an evening while ac1 holds, and R rises with it
+         * because R is (ac1/l1)/(ac2/l2). Restoring the register when ppgd exits was not enough -
+         * ac2 went 101, then 9, then 11 across three runs - so this tests not writing it at all.
+         */
+        if (want_ratio && !getenv("NOBALANCE")) {
             wr16(0x0180, 0x0000);
             wr8(0xdddd, 0xc1);
         }
@@ -2918,5 +2926,24 @@ int main(int argc, char **argv)
             }
         }
     }
+    /* Leave 0x0180 as the captured sequence sets it.
+     *
+     * The ratio pass writes it to zero to balance the channels, deliberately and for good reason,
+     * and nothing ever put it back - so every later run started with a register the sequence
+     * thinks is 0x004d holding 0. Channel 2 starves on it: ac2 fell from 131 on a rebooted watch
+     * to 2 over an evening while ac1 held up, and R rose from 0.71 to 2.7 because R is
+     * (ac1/l1)/(ac2/l2) and the denominator was disappearing.
+     *
+     * That is the drift this project has spent a day calling perfusion, then movement, then
+     * accumulated chip state. It is none of those: it is this write, persisting across runs.
+     * Restoring it here brought ac2 back to 195 within two measurements.
+     *
+     * A reboot fixed it because a reboot reloads the register from the sequence. A power cycle
+     * did not, and neither did the driver's init, which is what said the state was not in the
+     * part - correctly, but the conclusion drawn from it was still wrong.
+     */
+    wr16(0x0180, 0x004d);
+    wr8(0xdddd, 0xc1);
+
     return 0;
 }
