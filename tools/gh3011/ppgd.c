@@ -151,6 +151,54 @@ static double asum_x, asum_y, asum_z, asum_mag, asum_magsq;
 static double amag_lo = 1e18, amag_hi = -1e18;
 static long asamples;
 
+/* The accelerometer off the bus, when the driver's buffer is empty.
+ *
+ * The ACCEL ioctl reads a buffer the gh3011 driver keeps, and on this watch it returns nothing:
+ * every measurement reports motion=0/0, which is not a still wrist, it is no samples at all. The
+ * vendor's daemon used to fill that buffer and this replaced the vendor's daemon.
+ *
+ * The part itself is reachable - a DA217 at 2-0026, six bytes from 0x02 - which is how vitalsd
+ * serves steps and sleep bursts. I2C_SLAVE_FORCE because the da217 driver holds the address and
+ * only ever reads here.
+ *
+ * Returns the number of samples written, or 0. One sample per call rather than a burst: this is
+ * called from inside the sampling loop and a single reading at each pass is what the caller was
+ * getting from the ioctl anyway.
+ */
+#define I2C_SLAVE_FORCE 0x0706
+#define DA217_ADDR 0x26
+
+static int accel_fd = -2;
+
+static int da217_read(short *x, short *y, short *z)
+{
+    unsigned char reg = 0x02, v[6];
+
+    if (accel_fd == -2) {
+        accel_fd = open("/dev/i2c-2", O_RDWR);
+        if (accel_fd >= 0 && ioctl(accel_fd, I2C_SLAVE_FORCE, DA217_ADDR) < 0) {
+            close(accel_fd);
+            accel_fd = -1;
+        }
+    }
+    if (accel_fd < 0) {
+        static int said;
+        if (!said++ && getenv("ADBG")) fprintf(stderr, "da217: open/addr failed\n");
+        return 0;
+    }
+    if (write(accel_fd, &reg, 1) != 1 || read(accel_fd, v, 6) != 6) {
+        static int said2;
+        if (!said2++ && getenv("ADBG")) fprintf(stderr, "da217: transfer failed\n");
+        return 0;
+    }
+    /* Left-justified in the 14-bit configuration this part is set to; the shift is the same for
+     * every axis and a ratio of axes does not care about it, but the magnitudes below do. */
+    *x = (short)((v[1] << 8) | v[0]) >> 2;
+    *y = (short)((v[3] << 8) | v[2]) >> 2;
+    *z = (short)((v[5] << 8) | v[4]) >> 2;
+    return 1;
+}
+
 static void note_motion(void)
 {
     unsigned char b[608];
@@ -159,10 +207,62 @@ static void note_motion(void)
 
     if (nmotion >= MAXBURST) return;
     memset(b, 0, sizeof b);
-    if (ioctl(fd, ACCEL, b) < 0) { burst_motion[nmotion++] = -1.0; return; }
+    if (ioctl(fd, ACCEL, b) < 0) n = 0;
+    else n = b[0] | (b[1] << 8);
 
-    n = b[0] | (b[1] << 8);
-    if (n <= 0 || n > 100) { burst_motion[nmotion++] = -1.0; return; }
+    /* A count is not data.
+     *
+     * The driver hands back a buffer it never filled: a plausible sample count with every axis at
+     * zero. Gravity alone makes that impossible - a watch on a table still reads about 1g on one
+     * axis - so all-zero is the driver declining, not a motionless wrist. SleepService learned the
+     * same thing about the same part and drops those bursts rather than recording them.
+     *
+     * Testing only the count is what made this fall through to nothing: motion reads 0/0, the
+     * mean magnitude is zero, and the sleep sample is suppressed by its own guard with no
+     * indication why.
+     */
+    if (n > 0 && n <= 100) {
+        int z, allzero = 1;
+        for (z = 0; z < n && allzero; z++) {
+            const unsigned char *q = b + 2 + z * 6;
+            if (q[0] || q[1] || q[2] || q[3] || q[4] || q[5]) allzero = 0;
+        }
+        if (allzero) n = 0;
+    }
+
+    if (n <= 0 || n > 100) {
+        /* Nothing from the driver, so read the part instead - but not on every pass.
+         *
+         * This is called from inside the sampling loop, and an i2c transfer there costs the loop
+         * its timing: reading the DA217 every time turned measurements that had been working into
+         * no_cluster on a worn wrist, because the samples stopped arriving evenly. The driver's
+         * ioctl was cheap precisely because it was failing.
+         *
+         * Every other call. note_motion runs about once a second - twenty-six times across a
+         * twenty-five second measurement - so this is roughly one transfer every two seconds,
+         * which is nothing beside the sampling it sits inside. One in sixteen was the first
+         * guess and gave two samples for a whole measurement, where the sleep recorder gets
+         * eighty for a five second burst.
+         */
+        static int skip;
+        short ax, ay, az;
+
+        if ((skip++ & 1) != 0) { burst_motion[nmotion++] = -1.0; return; }
+        if (da217_read(&ax, &ay, &az)) {
+            double x = ax, y = ay, z = az;
+            double m = sqrt(x * x + y * y + z * z);
+            burst_motion[nmotion++] = 0.0;
+            if (naccel < MAXACC) accel_mag[naccel++] = m;
+            asum_x += x; asum_y += y; asum_z += z;
+            asum_mag += m; asum_magsq += m * m;
+            if (m < amag_lo) amag_lo = m;
+            if (m > amag_hi) amag_hi = m;
+            asamples++;
+        } else {
+            burst_motion[nmotion++] = -1.0;
+        }
+        return;
+    }
 
     for (i = 0; i < n; i++) {
         const unsigned char *q = b + 2 + i * 6;
@@ -2656,6 +2756,10 @@ int main(int argc, char **argv)
                 printf("\n");
             }
 
+            if (getenv("ADBG"))
+                fprintf(stderr, "asamples=%ld nmotion=%d accel_fd=%d\n",
+                        asamples, nmotion, accel_fd);
+
             if (asamples > 0) {
                 double mx = asum_x / asamples, my = asum_y / asamples, mz = asum_z / asamples;
                 double mm = asum_mag / asamples;
@@ -2678,7 +2782,7 @@ int main(int argc, char **argv)
                     }
                     if (naccel > 0) enmo /= naccel;
 
-                    printf("asleep n=%ld ax=%.5f ay=%.5f az=%.5f asd=%.5f aenmo=%.5f arange=%.5f\n",
+                    printf("asleep an=%ld ax=%.5f ay=%.5f az=%.5f asd=%.5f aenmo=%.5f arange=%.5f\n",
                            asamples, mx / mm, my / mm, mz / mm, sd / mm, enmo,
                            (amag_hi - amag_lo) / mm);
                 }
