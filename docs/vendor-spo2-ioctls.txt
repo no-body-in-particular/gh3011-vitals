@@ -1,0 +1,60 @@
+   0.066 IOCTL 40044702 arg=00000001 rc=0  <-- blocked
+   2.066 W dd dd c0 |  rc=1
+   2.074 W dd dd c4 |  rc=1
+   2.075 IOCTL 00004701 arg=f16fc53e rc=0
+ 205.649 IOCTL c0044708 arg=b6de5d94 rc=0  <-- blocked
+ 205.649 W dd dd c0 |  rc=1
+ 205.650 W dd dd c4 |  rc=1
+ 205.706 IOCTL 40044702 arg=00000001 rc=0  <-- blocked
+ 205.706 IOCTL 00004701 arg=f16fc53e rc=0  <-- blocked
+ 205.707 W dd dd c0 |  rc=1
+ 205.714 W dd dd c4 |  rc=1
+ 207.706 W dd dd c0 |  rc=1
+ 207.714 W dd dd c4 |  rc=1
+ 207.715 W dd dd c0 |  rc=1
+ 207.737 W dd dd c4 |  rc=1
+ 207.738 W dd dd c0 |  rc=1
+ 207.741 W dd dd c1 |  rc=1
+ 208.343 IOCTL 00004701 arg=f16fc53e rc=0  <-- blocked
+ 208.344 W dd dd c0 |  rc=1
+ 208.345 W dd dd c4 |  rc=1
+ 208.346 W dd dd c0 |  rc=1
+ 208.349 W dd dd a1 |  rc=1
+ 208.358 IOCTL 40184709 arg=7f676e90 rc=0
+ 209.345 IOCTL 00004701 arg=f16fc53e rc=0  <-- blocked
+ 209.346 IOCTL 825a470a arg=7f676920 rc=0
+ 209.363 W dd dd c3 |  rc=1
+ 209.373 IOCTL 40184709 arg=7f676e90 rc=0
+ 210.349 IOCTL 00004701 arg=f16fc53e rc=0  <-- blocked
+ 210.349 IOCTL 825a470a arg=7f676920 rc=0
+ 210.366 W dd dd c3 |  rc=1
+ 210.377 IOCTL 40184709 arg=7f676e90 rc=0
+ 211.352 IOCTL 00004701 arg=f16fc53e rc=0  <-- blocked
+ 211.353 IOCTL 825a470a arg=7f676920 rc=0
+ 211.370 W dd dd c3 |  rc=1
+ 211.382 IOCTL 40184709 arg=7f676e90 rc=0
+ 212.356 IOCTL 00004701 arg=f16fc53e rc=0  <-- blocked
+ 212.356 IOCTL 825a470a arg=7f676920 rc=0
+ 212.373 W dd dd c3 |  rc=1
+ 212.385 IOCTL 40184709 arg=7f676e90 rc=0
+ 213.359 IOCTL 00004701 arg=f16fc53e rc=0  <-- blocked
+ 213.360 IOCTL 825a470a arg=7f676920 rc=0
+ 213.377 W dd dd c3 |  rc=1
+ 213.389 IOCTL 40184709 arg=7f676e90 rc=0
+ 214.363 IOCTL 00004701 arg=f16fc53e rc=0  <-- blocked
+ 214.363 IOCTL 825a470a arg=7f676920 rc=0
+ 214.380 W dd dd c3 |  rc=1
+ 214.396 IOCTL 40184709 arg=7f676e90 rc=0
+ 215.366 IOCTL 00004701 arg=f16fc53e rc=0  <-- blocked
+ 215.366 IOCTL 825a470a arg=7f676920 rc=0
+ 215.383 W dd dd c3 |  rc=1
+ 215.399 IOCTL 40184709 arg=7f676e90 rc=0
+ 216.369 IOCTL 00004701 arg=f16fc53e rc=0  <-- blocked
+ 216.372 IOCTL 825a470a arg=7f676920 rc=0
+ 216.389 W dd dd c3 |  rc=1
+ 216.404 IOCTL 40184709 arg=7f676e90 rc=0
+ 217.373 IOCTL 00004701 arg=f16fc53e rc=0  <-- blocked
+ 217.373 IOCTL 825a470a arg=7f676920 rc=0
+ 217.390 W dd dd c3 |  rc=1
+ 217.406 IOCTL 40184709 arg=7f676e90 rc=0
+ 218.376 IOCTL 00004701 arg=f16fc53e rc=0  <-- blocked
