@@ -919,6 +919,42 @@ static int matched_amps(const double *strong, const double *w1, const double *w2
  * twelve recordings. Detrending first is the fix, and detrending is already done for everything
  * else, so this only needs to accept the result.
  */
+/* The ratio taken from the pulse alone, at the rate that was actually found.
+ *
+ * The beat-wise ratio measures peak against an interpolated baseline, which takes whatever is in
+ * the waveform between those two feet - the pulse, and also any drift, motion or gain settling
+ * that happens to be there. Both channels see the same wrist and the same arm, so whatever is
+ * common to them divides out to one, and a ratio of ratios pinned near 1.0 is what a measurement
+ * dominated by common mode looks like from the outside. Ours reads between 0.94 and 1.17 and is
+ * repeatable to a couple of percent, which is either a very steady wearer or a number that is not
+ * mostly made of pulse.
+ *
+ * This is the discriminating measurement: the amplitude in a narrow band at the detected rate,
+ * per channel, over the same samples. Anything not at the heart rate is excluded, so if the two
+ * agree with the beat-wise figure the ratio really is that; if the narrow one moves away from 1.0
+ * then the broadband one was measuring the arm.
+ */
+static double nb_r, nb_a1, nb_a2;
+
+static void narrow_ratio(int n, double fs, double bpm)
+{
+    double m1 = 0, m2 = 0, l1, l2;
+    int i;
+
+    nb_r = nb_a1 = nb_a2 = 0.0;
+    if (bpm <= 0.0 || n < 64 || fs <= 0.0) return;
+
+    for (i = 0; i < n; i++) { m1 += ch1[i]; m2 += ch2[i]; }
+    m1 /= n; m2 /= n;
+    l1 = m1 - dark_for(m1);
+    l2 = m2 - dark_for(m2);
+    if (l1 < 100.0 || l2 < 100.0) return;
+
+    nb_a1 = band_amp(ch1, n, fs, bpm / 60.0);
+    nb_a2 = band_amp(ch2, n, fs, bpm / 60.0);
+    if (nb_a2 > 0.0) nb_r = (nb_a1 / l1) / (nb_a2 / l2);
+}
+
 static double band_amp_d(const double *x, int n, double fs, double f)
 {
     int w = (int)(fs * 6.0), step, i, k, nw = 0;
@@ -3235,6 +3271,7 @@ int main(int argc, char **argv)
             double spo2 = 0, sut = 0, ai = 0, sbp = 0, dbp = 0;
             double mot_med = -1, mot_worst = -1;
             motion_summary(&mot_med, &mot_worst);
+            narrow_ratio(ns, fs, med);
 
             /* No percentage. R is printed because it is a real measurement and worth watching;
              * turning it into a saturation is what there is no basis for.
@@ -3306,7 +3343,8 @@ int main(int argc, char **argv)
             printf("hr=%.0f spread=%.0f hz=%.1f samples=%d windows=%d gain=%04x"
                    " dc1=%.0f dc2=%.0f ac1=%.0f ac2=%.0f r=%.3f spo2=%.0f beats=%d raw=%.0f/%.2f sut=%.0f ai=%.2f motion=%.0f/%.0f"
                    " conf=%.2f peaks=%d sutmed=%.0f sutmad=%.0f sutn=%d sbp=%.0f dbp=%.0f mcomp=%.3f/%.3f"
-                   " gsmean=%.0f gssd=%.0f gsmin=%.0f gsmax=%.0f gsrange=%.0f used=%s%s\n",
+                   " gsmean=%.0f gssd=%.0f gsmin=%.0f gsmax=%.0f gsrange=%.0f"
+                   " nb1=%.1f nb2=%.1f rband=%.3f used=%s%s\n",
                    med, spread, fs, ns, nrates, gain, dc1, dc2, a1, a2, r, spo2, shape_beats, shape_raw_sut, shape_raw_ai, sut, ai, mot_med, mot_worst,
                    /* Within two bpm, which is about what the reference itself holds to: the cuff
                     * moved between 58 and 61 across four minutes on a resting wearer, so a
@@ -3318,7 +3356,7 @@ int main(int argc, char **argv)
                    confidence_p(rates, nrates, 2.0), shape_peaks,
                    shape_sut_med, shape_sut_mad, shape_sut_n, sbp, dbp,
                    mcomp_frac1, mcomp_frac2,
-                   gs_mean, gs_sd, gs_min, gs_max, gs_max - gs_min,
+                   gs_mean, gs_sd, gs_min, gs_max, gs_max - gs_min, nb_a1, nb_a2, nb_r,
                    src == ch2 ? "ch2" : "ch1",
                    /* Say so when the windows did not agree on their own and the previous rate
                     * chose between them. Worth having under motion, and not the same claim as a
