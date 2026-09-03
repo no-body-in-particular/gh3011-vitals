@@ -2665,11 +2665,34 @@ int main(int argc, char **argv)
                         else if (lo_lvl < 12000.0 && gain < 0xe000)
                             newgain = (unsigned short)(gain + (gain >> 3));
                     } else {
-                        double span = RAIL_CODE - DARK_UNIT * 3.0;   /* the rail, less pedestal */
+                        /* Their numbers, not a guess at them.
+                         *
+                         * The band above was chosen as fractions of the span because Goodix state
+                         * theirs that way in published sources. This watch's own values turned out
+                         * to be readable: the saturation configuration the daemon hands the library
+                         * carries host parameters past the register range, and 0x2a02 to 0x2a15 are
+                         * ten 32-bit levels, five per channel - 60000, 38000, 58000, 40000, 10000
+                         * for one and the same with 14000 for the other.
+                         *
+                         * So the window is 40000 to 58000 in counts above the pedestal, with 60000
+                         * as the point to hurry away from and 10000 as the floor. The fractions
+                         * guessed here were 0.55 and 0.88 of a 64,852 span, or 35,669 and 57,070,
+                         * which was close enough to work and low enough to leave the loop settling
+                         * around 32,500 - under their floor for raising.
+                         */
+                        /* Two codes while far out, one while close, so a pass converges inside its
+                         * own length. A code is worth about 25% of the level, and a run starts at
+                         * 0x2828 clipping and has to come down off the rail before it climbs back
+                         * to the window: at one code a burst that was still moving at twenty-two
+                         * seconds, reaching 0x3a3a with the level at 34,000 and short of their
+                         * floor. Each change restarts the analysis window, so converging sooner is
+                         * also more of the pass spent measuring. */
                         int step = 0;
-                        if (hi_lvl >= span * 0.98)      step = -2;   /* clipping: get off it */
-                        else if (hi_lvl > span * 0.88)  step = -1;
-                        else if (hi_lvl < span * 0.55)  step = 1;
+                        if (hi_lvl >= 60000.0)      step = -2;   /* at the rail: get off it */
+                        else if (hi_lvl > 58000.0)  step = -1;
+                        else if (hi_lvl < 30000.0)  step = 2;
+                        else if (hi_lvl < 40000.0)  step = 1;
+                        if (step == 0 && lo_lvl < 10000.0) step = 1;  /* the faint one needs it too */
                         if (step) {
                             int hb = (gain >> 8) & 0xff, lb = gain & 0xff;
                             hb += step; lb += step;
