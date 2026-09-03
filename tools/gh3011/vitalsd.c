@@ -35,6 +35,7 @@
 #include <time.h>
 #include <sys/stat.h>
 #include <dirent.h>
+#include <sys/ioctl.h>   /* the accelerometer reads go through it; bionic pulls this in for free and musl does not */
 
 #define SOCKNAME "watchvitals"      /* abstract: android.net.LocalSocket, ABSTRACT namespace */
 #define HELPER   "/data/local/tmp/ppgd"
@@ -43,13 +44,53 @@
  * /dev/gh_tools to itself, and a daemon holding that open cannot also hand it to a measurement. */
 #define ADTHELPER "/data/local/tmp/adtwear"
 #define SECS_HR   "40"   /* green is 25 Hz: it needs the time to fill enough windows */
-#define SECS_SPO2 "45"   /* red is 100 Hz - 4,500 samples, plenty for the
-                          * windows and for the beat the shape is built on */
+/* Twenty-two seconds, because the pulse does not survive longer than that.
+ *
+ * This was 45. Alternating 22 and 45 on the same wrist, five runs, the effect is not subtle:
+ *
+ *     22s   ac1 106  ac2 102   r 1.045        45s   ac1 14  ac2  9   r 1.587
+ *     22s   ac1  97  ac2  93   r 1.046        45s   ac1 23  ac2 13   r 1.761
+ *     22s   ac1 103  ac2 100   r 1.033
+ *
+ * Five times the pulse and a ratio that repeats to 0.013 where the long pass wanders. The DC
+ * climbs about 3,100 counts over a long pass and the pulse collapses with it - heating, most
+ * likely, but the mechanism is a guess and the measurement is not.
+ *
+ * This is the drift. Every measurement this daemon has ever published used the 45-second pass,
+ * and every pass run by hand while investigating used twenty or twenty-five, which is exactly the
+ * discrepancy recorded further down this file as "publishes 70 to 73 with a ring median of 1.7 to
+ * 1.8" against hand runs of 0.585, 0.694 and 0.812 on the same wrist minutes apart. That was
+ * blamed on 0x0180 leaking out of the ratio pass; running the ratio pass first by hand, with and
+ * without NOBALANCE, does not reproduce it and duration does, every time.
+ */
+#define SECS_SPO2 "22"
 /* The balanced pass. The vendor spends about eight seconds here and we did too, but eight is
  * not enough on this sensor: four runs at 8 s gave R of 1.048, 0.907, 0.751 and 0.782, and the
  * same wrist at 25 s gave 0.877, 0.841 and 0.741 - half the spread. The extra seventeen seconds
  * are the cheapest accuracy available, and the pass is still shorter than the one after it. */
 #define SECS_RATIO "25"
+
+/* Saturation from the ratio: slope theirs, offset ours.
+ *
+ * The slope is not fitted. Their algorithm maps the ratio through aR^2 + bR + c with the
+ * coefficients in its config struct at 0x2c, 0x30 and 0x34, and the initialiser at 0x1f8c0 writes
+ * the defaults from three floats in the binary: 0.0, -25.0 and 110.0. The square term is zero, so
+ * their curve is the line 110 - 25R, exactly.
+ *
+ * The offset is ours and it is one point. Against a finger meter reading 99 steadily - fourteen
+ * readings over the morning, 98 on about a third of them, mean 98.7 - this sensor gave R between
+ * 0.98 and 1.07 across single passes and through the daemon, median 1.035. That puts the intercept
+ * at 98.7 + 25 * 1.035.
+ *
+ * What that is worth: it is an offset calibrated at one saturation on one wearer in one session,
+ * on a slope borrowed from the vendor. Near 99% it is measured. Below about 95% it is
+ * extrapolation and nothing here has tested it, which cannot be fixed without a wearer who
+ * desaturates. The vendor's own daemon read 96 against the same meter's 99, so their offset does
+ * not transfer either - which is what the override block in Goodix's published example, the one
+ * this watch never writes, exists to correct.
+ */
+#define SPO2_SLOPE     25.0
+#define SPO2_INTERCEPT 124.6
 
 /* Where the short pass leaves its samples for the long pass to explain. See measure(). */
 #define KEEP "/data/local/tmp/pass1.txt"
@@ -384,7 +425,26 @@ static unsigned acc_gain;
 static void acc_add(double perf1, double perf2, unsigned gain)
 {
     if (perf1 <= 0.0 || perf2 <= 0.0) return;
-    if (gain != acc_gain) { acc_at = 0; acc_n = 0; acc_gain = gain; }
+
+    /* Reset only when the gain has really moved.
+     *
+     * This reset on any change at all, which was right when the two passes ran at 0x2828 and
+     * 0x2323 - a threefold difference in level between them. The gain loop now settles within a
+     * few codes of itself, 0x3434 to 0x3737 across consecutive passes, and resetting on each of
+     * those meant the accumulator never reached the three entries it needs: it sat at accn=1
+     * indefinitely and no saturation was ever published, whatever the gate above it said.
+     *
+     * What is stored is perfusion - ac over level - which is normalised for gain by construction,
+     * so a few codes cannot invalidate it. A large jump still can, and still resets.
+     */
+    {
+        int dh = (int)((gain >> 8) & 0xff) - (int)((acc_gain >> 8) & 0xff);
+        int dl = (int)(gain & 0xff) - (int)(acc_gain & 0xff);
+        if (dh < 0) dh = -dh;
+        if (dl < 0) dl = -dl;
+        if (dh > 4 || dl > 4) { acc_at = 0; acc_n = 0; }
+        acc_gain = gain;
+    }
     acc_n1[acc_at] = perf1;
     acc_n2[acc_at] = perf2;
     acc_at = (acc_at + 1) % ACC_MAX;
@@ -1036,7 +1096,7 @@ static void measure(const char *mode, char *out, size_t outsz)
              * produces says it does not. That is the next thing to chase and it is a specific
              * question rather than a search.
              */
-            if (getenv("SPO2ABS") && an >= 3 && carried >= 0.0012
+            if (an >= 3 && carried >= 0.0012
                 && racc > 0.05 && racc < 5.0) {
                 /* The median of the passes, not their pulse-weighted mean. See ring_add above. */
                 double med_r = 0, med_spread = 0;
@@ -1056,9 +1116,10 @@ static void measure(const char *mode, char *out, size_t outsz)
                  * amplitude would move every reading down six points and fix nothing, so it stays
                  * at 116 until the signal behind R is worth the vendor's constant.
                  */
-                double abs_sat = 116.0 - 25.0 * (med_n >= 3 ? med_r : racc);
+                double abs_sat = SPO2_INTERCEPT - SPO2_SLOPE * (med_n >= 3 ? med_r : racc);
+                if (abs_sat > 100.0) abs_sat = 100.0;   /* saturation has a ceiling */
 
-                if (abs_sat >= 70.0 && abs_sat <= 100.0) {
+                if (abs_sat >= 70.0) {
                     size_t at4 = strlen(ratio_out);
                     snprintf(ratio_out + at4, ratio_sz - at4,
                              " spo2abs=%.0f spo2n=%d spo2r=%.3f spo2spread=%.3f",
