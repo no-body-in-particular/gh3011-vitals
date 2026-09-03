@@ -118,6 +118,37 @@ static double dark_for(double dc)
  */
 #define SETTLE_SECS 3.0
 
+/* The level the gain loop aims for, in counts above the dark pedestal.
+ *
+ * Measured rather than chosen. The 1 Hz component that rides on the burst cadence grows far
+ * faster with the level than the pulse does, so the operating point has to sit below where it
+ * appears - two passes on one wrist minutes apart, settling excluded from both:
+ *
+ *     level 50,889   rms 187.7   1 Hz 80.1 (43% of rms)   read 60 bpm   cuff 50
+ *     level 25,529   rms  23.2   1 Hz  3.1 (13% of rms)   read 49 bpm   cuff 50
+ *
+ * Twice the level for twenty-six times the artefact. The rail is at about 64,900, so this also
+ * leaves room for a wrist brighter than the one it was measured on.
+ */
+#define AGC_TARGET 26000.0
+
+/* The code that would put this channel on the target, from the code it is on now and the level
+ * that produced. Clamped to a dozen codes a move so one bad reading cannot fling the LED to an
+ * extreme, and left alone inside a deadband because every change costs the analysis window. */
+static int solve_code(int code, double lvl)
+{
+    double want;
+    int step;
+    if (lvl > 62000.0) return code - 8;            /* railed: the level says nothing */
+    if (code <= 0 || lvl < 500.0) return code + 4; /* too dark to reason from: open up */
+    if (lvl > AGC_TARGET * 0.85 && lvl < AGC_TARGET * 1.18) return code;
+    want = AGC_TARGET * (double)code / lvl;
+    step = (int)(want + 0.5) - code;
+    if (step >  12) step =  12;
+    if (step < -12) step = -12;
+    return code + step;
+}
+
 /* How far back to look for the foot of a beat.
  *
  * This was a third of a beat, which makes the window a function of the heart rate and lets the
@@ -1659,6 +1690,23 @@ static int shape_peaks = 0;
 static double shape_sut_med = 0, shape_sut_mad = -1;   /* per-beat upstroke, and how much the
                                                         * beats disagreed about it */
 static int shape_sut_n = 0;
+
+/* The b/a ratio of the second-derivative wave, and whether it was found at all.
+ *
+ * The upstroke is only as good as the foot, and the foot is the noisiest thing measured here -
+ * the beats disagree about it by thirty to eighty milliseconds even on a still wrist. The second
+ * derivative needs no foot. Its first positive wave (a) sits on the steepest part of the rise and
+ * its following trough (b) on the shoulder after the peak, and the ratio between them is a
+ * standard stiffness index: about -0.8 in compliant arteries, rising towards zero as they
+ * stiffen, and self-normalising, so the amplitude of the pulse drops out of it.
+ *
+ * Reported only. Nothing is fitted to it and the pressure does not use it, because fitting a
+ * coefficient to a feature before knowing how it behaves is how the last pressure formula came
+ * to describe an artefact. This is here to find out whether it holds still across passes where
+ * the upstroke does not.
+ */
+static double shape_ba = 0;
+static int shape_ba_ok = 0;
 static double shape_raw_sut = 0, shape_raw_ai = 0;   /* before the gate, for the report */
 
 /* The upstroke of a single beat, in milliseconds, or 0 if its foot cannot be located.
@@ -1872,6 +1920,35 @@ static void pulse_shape(const double *d, int n, double fs, double bpm, double *s
     if (used < 4) return;
     for (j = 0; j < wlen; j++) ens[j] = acc[j] / used;
     shape_beats = used;
+
+    /* Second derivative of the ensemble, over a fixed twenty milliseconds rather than adjacent
+     * samples: a second difference on neighbours has a gain that climbs with frequency, so on a
+     * hundred-hertz trace it finds wherever the noise peaked. Twenty milliseconds is short
+     * against the waves being located and long enough to sit above the sample-to-sample noise. */
+    {
+        int h = (int)(fs * 0.020);
+        int q, ai_ = -1, bi_ = -1;
+        double amax = -1e18, bmin = 1e18;
+        if (h < 1) h = 1;
+        shape_ba = 0;
+        shape_ba_ok = 0;
+        for (q = h; q < pre && q + h < wlen; q++) {
+            double d2 = ens[q-h] - 2.0 * ens[q] + ens[q+h];
+            if (d2 > amax) { amax = d2; ai_ = q; }
+        }
+        if (ai_ > 0) {
+            int lim = ai_ + (int)(fs * 0.20);
+            if (lim > wlen - h - 1) lim = wlen - h - 1;
+            for (q = ai_ + 1; q <= lim; q++) {
+                double d2 = ens[q-h] - 2.0 * ens[q] + ens[q+h];
+                if (d2 < bmin) { bmin = d2; bi_ = q; }
+            }
+        }
+        if (ai_ > 0 && bi_ > ai_ && amax > 0.0 && bmin < 0.0) {
+            shape_ba = bmin / amax;
+            shape_ba_ok = 1;
+        }
+    }
 
     /* What the beats made of the upstroke individually, before the average hid the disagreement.
      *
@@ -2894,16 +2971,55 @@ int main(int argc, char **argv)
                          *   level 38,313  ac1 17  ac2  9  r 1.895     above it, window clean
                          * The equal amplitudes and the ratio of one are the contaminated case.
                          */
+                        /* Solve for the gain instead of walking to it, one channel at a time.
+                         *
+                         * The ladder this replaces moved one or two codes at a time on the belief,
+                         * recorded in these notes for a long time, that a code was worth about a
+                         * quarter of the level. It is not. Measured on this watch with both bytes
+                         * held equal and the settling excluded:
+                         *
+                         *     0x3030   level 34,441   amp 19.4
+                         *     0x4040   level 47,928   amp 31.8
+                         *     0x5050   level 61,861   amp 60.7
+                         *     0x6060   level 64,864   amp  0.1   railed, and so is everything above
+                         *
+                         * A straight line through the origin - about 750 counts per code, which is
+                         * what an LED current linear in the code and a detector linear in the light
+                         * should give - with the rail just under 65,000. The quarter-per-code was
+                         * measured across that rail, where the level stops responding at all.
+                         *
+                         * Linear through the origin means the constant never has to be known: a
+                         * code and the level it produced give it, so the code that lands on the
+                         * target is target * code / level. One move from anywhere, re-derived every
+                         * pass rather than trusted from a comment.
+                         *
+                         * And one per channel, because 0x0118 is two bytes - an LED current each -
+                         * and stepping them together is what made the first version of this useless.
+                         * The channels sit far apart on this wrist, so aiming the brighter one at
+                         * the target drove the other to the floor: 0x450a, three counts of pulse on
+                         * channel 1, and the rate read off channel 2 instead. Nothing couples them.
+                         * The note elsewhere in this file that we have one gain for both is wrong.
+                         *
+                         * A railed reading is the one case this cannot reason from, because there
+                         * the level no longer follows the code and the arithmetic asks for nothing.
+                         * Back off hard and look again.
+                         */
+                        int hb = (gain >> 8) & 0xff, lb = gain & 0xff;
+                        int nhb = hb, nlb = lb;
+                        double lvl1 = dc1 - DARK_UNIT * 3.0;   /* low byte drives channel 1 */
+                        double lvl2 = dc2 - DARK_UNIT * 3.0;   /* high byte drives channel 2 */
                         int step = 0;
-                        if (hi_lvl >= 60000.0)          { step = -2; gain_dir = -1; }
-                        else if (hi_lvl > 58000.0)      { step = -1; gain_dir = -1; }
-                        else if (hi_lvl < 30000.0)      { step =  2; gain_dir =  1; }
-                        else if (hi_lvl < 34000.0)      { step =  1; gain_dir =  1; }
-                        else if (gain_dir > 0 && hi_lvl < 42000.0) step = 1;   /* carry on up */
-                        else if (gain_dir < 0 && hi_lvl > 50000.0) step = -1;  /* carry on down */
-                        else gain_dir = 0;
-                        if (step == 0 && lo_lvl < 10000.0) { step = 1; gain_dir = 1; }
 
+                        nlb = solve_code(lb, lvl1);
+                        nhb = solve_code(hb, lvl2);
+                        if (nlb < GAIN_CODE_MIN) nlb = GAIN_CODE_MIN;
+                        if (nhb < GAIN_CODE_MIN) nhb = GAIN_CODE_MIN;
+                        if (nlb > GAIN_CODE_MAX) nlb = GAIN_CODE_MAX;
+                        if (nhb > GAIN_CODE_MAX) nhb = GAIN_CODE_MAX;
+                        if (gain_changes < 24 && (nhb != hb || nlb != lb))
+                            newgain = (unsigned short)((nhb << 8) | nlb);
+                        gain_dir = 0;
+                        (void)step; (void)lo_lvl; (void)hi_lvl;
                         /* And a hard stop. However the band is drawn, a loop that is still moving
                          * at the end of a pass has measured nothing, and the caller cannot tell
                          * that from a quiet wrist. After this many changes it stays where it is and
@@ -2912,16 +3028,7 @@ int main(int argc, char **argv)
                          * Twenty-four rather than twelve: the part starts clipped, so the loop has
                          * to walk down off the rail and back up to the band, and at twelve it ran
                          * out on the way and stopped short. */
-                        if (gain_changes >= 24) step = 0;
-                        if (step) {
-                            int hb = (gain >> 8) & 0xff, lb = gain & 0xff;
-                            hb += step; lb += step;
-                            if (hb < GAIN_CODE_MIN) hb = GAIN_CODE_MIN;
-                            if (lb < GAIN_CODE_MIN) lb = GAIN_CODE_MIN;
-                            if (hb > GAIN_CODE_MAX) hb = GAIN_CODE_MAX;
-                            if (lb > GAIN_CODE_MAX) lb = GAIN_CODE_MAX;
-                            newgain = (unsigned short)((hb << 8) | lb);
-                        }
+
                     }
                 } else if (gain > 0x1000 &&
                     (dc1 > 3200000.0 || (want_spo2 && dc2 > 3200000.0)))
@@ -3550,7 +3657,7 @@ int main(int argc, char **argv)
 
             printf("hr=%.0f spread=%.0f hz=%.1f samples=%d windows=%d gain=%04x"
                    " dc1=%.0f dc2=%.0f ac1=%.0f ac2=%.0f r=%.3f beats=%d raw=%.0f/%.2f sut=%.0f ai=%.2f motion=%.0f/%.0f"
-                   " conf=%.2f peaks=%d sutmed=%.0f sutmad=%.0f sutn=%d sbp=%.0f dbp=%.0f mcomp=%.3f/%.3f"
+                   " conf=%.2f peaks=%d sutmed=%.0f sutmad=%.0f sutn=%d ba=%.3f sbp=%.0f dbp=%.0f mcomp=%.3f/%.3f"
                    " gsmean=%.0f gssd=%.0f gsmin=%.0f gsmax=%.0f gsrange=%.0f"
                    " nb1=%.1f nb2=%.1f rband=%.3f used=%s%s\n",
                    med, spread, fs, ns, nrates, gain, dc1, dc2, a1, a2, r, shape_beats, shape_raw_sut, shape_raw_ai, sut, ai, mot_med, mot_worst,
@@ -3562,7 +3669,7 @@ int main(int argc, char **argv)
                     * agreed. sut above is from the ensemble and is what the pressure uses; this
                     * says how much to believe it. */
                    confidence_p(rates, nrates, 2.0), shape_peaks,
-                   shape_sut_med, shape_sut_mad, shape_sut_n, sbp, dbp,
+                   shape_sut_med, shape_sut_mad, shape_sut_n, shape_ba_ok ? shape_ba : 0.0, sbp, dbp,
                    mcomp_frac1, mcomp_frac2,
                    gs_mean, gs_sd, gs_min, gs_max, gs_max - gs_min, nb_a1, nb_a2, nb_r,
                    src == ch2 ? "ch2" : "ch1",
