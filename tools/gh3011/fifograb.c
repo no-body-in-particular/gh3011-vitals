@@ -6,19 +6,27 @@
  * moving. But their daemon gets a working saturation from this same sensor, the same registers and
  * the same FIFO, so the photons carry the information and our extraction is losing it.
  *
- * This splits acquisition from arithmetic. Their daemon configures the part and starts it; the
- * daemon is then killed without being allowed to stop the chip, which keeps streaming with their
- * configuration; and this drains the FIFO and writes the samples out. Then:
+ * This splits acquisition from arithmetic. Their daemon configures the part and starts it; it is
+ * then frozen with SIGSTOP, which leaves its /dev/gh_tools fd open so the driver never halts the
+ * part; and this drains the FIFO and writes the samples out. It has been run, and the answer is
+ * that our arithmetic is at fault - see docs/gh3011.md. From their stream, their configuration and
+ * their gain, our formula gives R = 1.197 where their daemon reading the same samples reported 98
+ * percent, which on their own curve is R = 0.496.
  *
- *   R from their stream still near 1.05  ->  the fault is in our maths, and it is findable
- *   R from their stream near 0.5         ->  the fault is our configuration, and theirs is the fix
+ * Three designs were tried before one worked, and the failures are worth keeping:
  *
- * Either way it is an answer rather than another fitted constant.
+ *   reading alongside their daemon   two processes draining one FIFO each get a decimated stream
+ *                                    full of gaps, and a one hertz pulse cannot be measured in the
+ *                                    quarter-second bursts that survive
+ *   kill -9 then read                closing their fd makes the driver halt the part on release:
+ *                                    295 samples in 3 reads, then 2845 empty polls over 30 seconds
+ *   polling instead of waiting       re-reads a slowly-updating register rather than draining the
+ *                                    FIFO: 92,967 samples in 30 s, three thousand a second where
+ *                                    two channels at a hundred hertz give two hundred, consecutive
+ *                                    values differing by one or two counts
  *
- * Reading alongside their daemon rather than after it was the first design and it is worse: both
- * would be draining one hardware FIFO, so each would get a decimated stream full of gaps, and a
- * one hertz pulse cannot be measured in the quarter-second bursts that survive. Killing the daemon
- * first costs their reported number being a few seconds stale against ours and nothing else.
+ * Waiting on the interrupt with the daemon frozen gives 6200 samples in 31 reads over 30.9 seconds,
+ * which is 200 a second, which is right.
  *
  *     fifograb <seconds> <outfile> [noarm]
  *
@@ -39,6 +47,7 @@
 #include <sys/ioctl.h>
 
 #define XFER 0xc0084704u
+#define WAIT 0x00004701u          /* blocks until the part has a burst ready */
 #define ADDR 0x14
 #define FIFO_LEVEL 0x004a
 #define FIFO_DATA  0xaaaa
@@ -121,17 +130,22 @@ int main(int argc, char **argv)
         unsigned short lvl = 0;
         int want, k;
 
+        /* Wait for the burst rather than polling for it.
+         *
+         * Polling read the same value over and over: 92,967 samples in thirty seconds, three
+         * thousand a second where two channels at a hundred hertz give two hundred, and consecutive
+         * values differing by one or two counts. That is a slowly-updating current-value register
+         * being re-read, not a FIFO being drained.
+         *
+         * The race this was avoiding does not exist here. The daemon is frozen, not running, so
+         * nothing else is waiting on the interrupt and blocking on it is safe.
+         */
+        if (arm) wr8(CMD_REG, CMD_ARM);
+        if (ioctl(fd, WAIT, 0) < 0) { empty++; usleep(2000); continue; }
+
         if (rd16(FIFO_LEVEL, &lvl) < 0) { usleep(5000); continue; }
         want = (int)lvl * 3;
-        if (want <= 0) {
-            empty++;
-            /* Their daemon waits on the interrupt; this polls, because two processes blocking on
-             * one interrupt is the race this design exists to avoid. Ten milliseconds is well
-             * inside a burst at a hundred hertz. */
-            usleep(10000);
-            if (arm) wr8(CMD_REG, CMD_ARM);
-            continue;
-        }
+        if (want <= 0) { empty++; continue; }
         if (want > (int)sizeof buf) want = (int)sizeof buf;
 
         if (rdn(FIFO_DATA, buf, want) < 0) { usleep(5000); continue; }
@@ -141,7 +155,6 @@ int main(int argc, char **argv)
             total++;
         }
         rounds++;
-        if (arm) wr8(CMD_REG, CMD_ARM);
     }
 
     fclose(f);

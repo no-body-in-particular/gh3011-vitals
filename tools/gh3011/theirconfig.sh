@@ -6,7 +6,7 @@
 # and our extraction loses it. This finds out which half is wrong.
 #
 #   1. their daemon configures the part and runs a saturation, and reports its own answer
-#   2. the daemon is killed - not stopped - so the part keeps streaming with their settings
+#   2. the daemon is frozen with SIGSTOP, so the part keeps streaming with their settings
 #   3. fifograb drains the FIFO and writes the samples out, configuring nothing
 #
 # Then R is computed offline from their stream:
@@ -14,9 +14,16 @@
 #   still near 1.05  ->  the fault is our arithmetic
 #   near 0.5         ->  the fault is our configuration, and theirs is the fix
 #
-# Killing rather than stopping matters. `setprop ctl.stop` lets the daemon run its shutdown, which
-# halts the chip - and then there is nothing left to read. SIGKILL leaves the part exactly as their
-# code last set it.
+# Stopping the process, not killing it, and not asking init to stop the service. There are three
+# ways to take their daemon out of the way and only one of them leaves anything to read:
+#
+#   setprop ctl.stop   runs their shutdown, which halts the part
+#   kill -9            closes their /dev/gh_tools fd, and the driver halts the part on release -
+#                      measured: 295 samples in 3 reads, then 2845 empty polls over 30 seconds
+#   kill -STOP         freezes the process with its fd still open, so the driver never sees a
+#                      release and the part keeps streaming with their configuration
+#
+# The daemon is continued and stopped properly afterwards.
 #
 # Everything is restored at the end whatever happens, including on the paths that exit early.
 SECS=${1:-30}
@@ -55,11 +62,12 @@ sleep $HOLD
 logcat -d | grep "spo2_result" > /data/local/tmp/theirs.txt
 grep -c . /data/local/tmp/theirs.txt
 
-# Kill, do not stop: a clean shutdown would halt the part and leave nothing to read.
+# Freeze it: its fd stays open, so the driver leaves the part running with their settings.
 PID=$(ps | grep gh3011_service.real | while read u p rest; do echo $p; done)
-echo "--- killing $PID and reading their stream for ${SECS}s"
-kill -9 $PID 2>/dev/null
+echo "--- freezing $PID and reading their stream for ${SECS}s"
+kill -STOP $PID 2>/dev/null
 /data/local/tmp/fifograb $SECS /data/local/tmp/theirstream.txt
 echo "--- samples: $(grep -c . /data/local/tmp/theirstream.txt)"
+kill -CONT $PID 2>/dev/null
 
 restore
