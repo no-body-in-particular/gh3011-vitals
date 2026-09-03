@@ -99,6 +99,15 @@ static double dark_for(double dc)
  * to revisit if saturation ever reads implausibly. */
 #define R_REST 0.35
 
+/* How long after a gain change the samples are worth analysing.
+ *
+ * One second was not enough. A change steps the DC by about 9,500 counts, and a step left inside
+ * the window is common to both channels and two orders above the pulse, which inflates both
+ * amplitudes and drives their ratio to one. That is the shape of every suspiciously tidy R this
+ * file has recorded. Three seconds costs two seconds of a thirty second pass and removes it.
+ */
+#define SETTLE_SECS 3.0
+
 /* The vendor's saturation curve for this watch, and what our ratio has to be divided by to use it.
  *
  * The curve is not fitted here. It is the host parameter block their daemon hands the library -
@@ -1982,6 +1991,7 @@ int main(int argc, char **argv)
     unsigned short gainfix = 0;     /* GAINFIX: pin the gain once the loop has unclipped the part */
     int gain_locked = 0;
     int gain_changes = 0;           /* a loop still moving at the end has measured nothing */
+    int gain_dir = 0;               /* which way the loop is travelling, for the hysteresis */
     /* What the rate was last time, if the caller knows. Only used to break a tie between two
      * candidate clusters under motion; never to nudge an answer that stood on its own. */
     double prev_bpm = 0.0;
@@ -2817,19 +2827,45 @@ int main(int argc, char **argv)
                          * So: only move when the level is genuinely outside the band, and stop
                          * moving once it is inside. Their 40000 is where the loop should aim when
                          * it has to move at all, not the edge at which it starts moving.
+                         *
+                         * The band is [38000, 58000] because the first attempt at it, raising only
+                         * below 34000, stopped the loop at a level of 33,288 with amplitudes of 15
+                         * and 8 - under their floor of 40000 and well under the 34 counts their own
+                         * saturation mode will accept. A step is worth about a quarter, so from
+                         * inside this band one move lands inside it again rather than across it.
+                         */
+                        /* Hysteresis, because a plain band still oscillates at its own edge.
+                         *
+                         * A threshold that both starts and stops the movement puts the settled
+                         * level next to it by construction, and the level wanders across it. Two
+                         * bands with 34000 to raise and 42000 to stop raising cannot do that: once
+                         * moving it carries past the trigger before it stops, and a step is worth
+                         * about a quarter so one move crosses the gap.
+                         *
+                         * Measured at the previous single-threshold band, at one settled gain:
+                         *   level 36,038  ac1 68  ac2 68  r 1.008     below the trigger, still moving
+                         *   level 38,313  ac1 17  ac2  9  r 1.895     above it, window clean
+                         * The equal amplitudes and the ratio of one are the contaminated case.
                          */
                         int step = 0;
-                        if (hi_lvl >= 60000.0)      step = -2;   /* at the rail: get off it */
-                        else if (hi_lvl > 58000.0)  step = -1;
-                        else if (hi_lvl < 26000.0)  step = 2;
-                        else if (hi_lvl < 34000.0)  step = 1;
-                        if (step == 0 && lo_lvl < 10000.0) step = 1;  /* the faint one needs it too */
+                        if (hi_lvl >= 60000.0)          { step = -2; gain_dir = -1; }
+                        else if (hi_lvl > 58000.0)      { step = -1; gain_dir = -1; }
+                        else if (hi_lvl < 30000.0)      { step =  2; gain_dir =  1; }
+                        else if (hi_lvl < 34000.0)      { step =  1; gain_dir =  1; }
+                        else if (gain_dir > 0 && hi_lvl < 42000.0) step = 1;   /* carry on up */
+                        else if (gain_dir < 0 && hi_lvl > 50000.0) step = -1;  /* carry on down */
+                        else gain_dir = 0;
+                        if (step == 0 && lo_lvl < 10000.0) { step = 1; gain_dir = 1; }
 
                         /* And a hard stop. However the band is drawn, a loop that is still moving
                          * at the end of a pass has measured nothing, and the caller cannot tell
                          * that from a quiet wrist. After this many changes it stays where it is and
-                         * the rest of the pass is at least analysable. */
-                        if (gain_changes >= 12) step = 0;
+                         * the rest of the pass is at least analysable.
+                         *
+                         * Twenty-four rather than twelve: the part starts clipped, so the loop has
+                         * to walk down off the rail and back up to the band, and at twelve it ran
+                         * out on the way and stopped short. */
+                        if (gain_changes >= 24) step = 0;
                         if (step) {
                             int hb = (gain >> 8) & 0xff, lb = gain & 0xff;
                             hb += step; lb += step;
@@ -2989,7 +3025,7 @@ int main(int argc, char **argv)
      * nothing that needs a settled rate. */
     if (want_ratio) {
         double d1 = 0, d2 = 0, l1, l2, a1 = 0, a2 = 0, r = 0, bpm, best = 0, bestf = 0;
-        int k, skip = settled_at + (int) fs;
+        int k, skip = settled_at + (int)(fs * SETTLE_SECS);
         int n = ns - skip;
 
         if (n < 200 || fs <= 0) {
@@ -3059,7 +3095,7 @@ int main(int argc, char **argv)
      * why three runs on a 65-70 bpm wearer returned 58, 46 and 42. */
     {
         /* Drop the settling period, plus a second for the baseline filter to fill. */
-        int skip = settled_at + (int)fs;
+        int skip = settled_at + (int)(fs * SETTLE_SECS);
         if (skip > 0 && ns - skip > (int)(fs * 12)) {
             memmove(ch1, ch1 + skip, (ns - skip) * sizeof ch1[0]);
             memmove(ch2, ch2 + skip, (ns - skip) * sizeof ch2[0]);
@@ -3147,7 +3183,7 @@ int main(int argc, char **argv)
                  * transient and calls it a pulse - which is how a first attempt reported an
                  * amplitude of 3900 on a channel that carries 5. */
                 double q1 = 0, q2 = 0, e1 = 0, e2 = 0;
-                int qi, qs = settled_at + (int)fs, qn = ns - qs;
+                int qi, qs = settled_at + (int)(fs * SETTLE_SECS), qn = ns - qs;
                 if (qn > 32) {
                     for (qi = qs; qi < ns; qi++) { q1 += ch1[qi]; q2 += ch2[qi]; }
                     q1 /= qn; q2 /= qn;
