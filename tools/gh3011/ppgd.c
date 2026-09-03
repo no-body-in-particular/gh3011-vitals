@@ -151,6 +151,14 @@ static int nmotion;
 /* The arm's movement as one continuous series, for use as a noise reference. */
 #define MAXACC 24000
 static double accel_mag[MAXACC];
+/* And the axes themselves, because the magnitude is the wrong reference.
+ *
+ * sqrt(x^2+y^2+z^2) is rotation-invariant, and a wrist rotating is exactly what breaks the
+ * sensor's contact with the skin. Fitting against the magnitude removed 0.3% of a channel's
+ * variance on a pass whose motion figure was 2556/4959 - a no-op on the worst movement available.
+ * The axes keep the tilt the magnitude throws away.
+ */
+static float accel_x[MAXACC], accel_y[MAXACC], accel_z[MAXACC];
 static int naccel;
 
 /* The same samples, summed for the sleep record.
@@ -206,7 +214,12 @@ static void *acc_sampler(void *unused)
         if (da217_read(&ax, &ay, &az)) {
             double x = ax, y = ay, z = az;
             double m = sqrt(x * x + y * y + z * z);
-            if (naccel < MAXACC) accel_mag[naccel++] = m;
+            if (naccel < MAXACC) {
+                accel_x[naccel] = (float)x;
+                accel_y[naccel] = (float)y;
+                accel_z[naccel] = (float)z;
+                accel_mag[naccel++] = m;
+            }
             asum_x += x; asum_y += y; asum_z += z;
             asum_mag += m; asum_magsq += m * m;
             if (m < amag_lo) amag_lo = m;
@@ -1039,7 +1052,40 @@ static double spectral_bpm_d(const double *d, int n, double fs, double *conf)
  * The rest follows them too: a ratio per beat rather than one for the record, then the median.
  * One beat where the arm twitched moves a mean and cannot move a median.
  */
-/* Take the movement out of both channels before the ratio is measured.
+/* Take the movement out of both channels before the ratio is measured - which does not work.
+ *
+ * Three versions of this have now been tried on a worn wrist and all three make the measurement
+ * worse. It is off, it stays off, and it is kept only because the next person will otherwise try
+ * the same three things.
+ *
+ *   against the magnitude          removed 0.3% of a channel's variance on a pass whose motion
+ *                                  figure was 2556/4959. A no-op on the worst movement available,
+ *                                  because sqrt(x^2+y^2+z^2) is rotation-invariant and a wrist
+ *                                  rotating is exactly what breaks contact with the skin.
+ *
+ *   against the three axes         removed 3-5%, and ac1 went from 97 to 723 with the rate falling
+ *                                  off a steady 60 to 46.
+ *
+ *   axes, band-limited above       removed 29% on a pass whose motion figure was 55/168 - about as
+ *   half a hertz                   still as this wrist gets - with ac1 524 against 76, and the two
+ *                                  passes after it failed outright.
+ *
+ * Why is now measured rather than guessed. Logged at 100 Hz on the wrist, the accelerometer's
+ * content is dominated by slow arm drift: the peak is at 30 bpm on every axis, with standard
+ * deviations of 305, 560 and 151 counts, and only 5 to 10 percent of that sits at the pulse
+ * frequency. So the reference is not contaminated with the heartbeat - that hypothesis is dead -
+ * it is simply several times larger than the pulse and almost all of it is below the band the
+ * pulse lives in. Fitting six regressors of that against a channel finds the channel's own
+ * baseline drift, and subtracting the fit leaves a residual whose feet no longer sit where the
+ * beat detector expects, which is why the measured amplitude inflates rather than falls.
+ *
+ * What that argues for is the use the accelerometer is already being put to: excluding motion
+ * frequencies when choosing the pulse rate, which is what TROIKA and its successors do and what
+ * the rate estimator in this file does - and which only started working at all once the sampler
+ * thread gave it more than eleven samples to work with. Subtraction in the time domain needs a
+ * reference that describes the artefact and this one describes the arm.
+ *
+ * The original reasoning follows, and still describes what the code does.
  *
  * Until now movement was only ever a veto here: too little amplitude, or windows that disagree, and
  * the pass is thrown away whole. The vendor does not throw it away - spo2_r_value comes out of a
@@ -1064,76 +1110,175 @@ static double spectral_bpm_d(const double *d, int n, double fs, double *conf)
  */
 static double mcomp_frac1, mcomp_frac2;
 
-static void motion_clean(unsigned int *a, unsigned int *b, int n)
+#define MC_REG 6                      /* x y z and their first differences */
+
+static void motion_clean(unsigned int *a, unsigned int *b, int n, double fs)
 {
-    static double mo[MAXS], u1[MAXS], u2[MAXS];
-    double s11 = 0, s12 = 0, s22 = 0, det;
-    double m1 = 0, m2 = 0;
-    int i;
+    static double u[MC_REG][MAXS], hp[MAXS];
+    int win;
+    double g[MC_REG][MC_REG + 1];
+    int i, j, k, c;
 
     mcomp_frac1 = mcomp_frac2 = 0.0;
     if (n < 256 || naccel < 64 || n > MAXS) return;
 
-    /* The accelerometer onto the optical grid. The two run at their own rates and are mapped by
-     * position through the measurement, which is what the rest of this file already does with
-     * them; linear between samples rather than nearest, because a step in the reference would put
-     * a step into everything it is subtracted from. */
+    /* The axes onto the optical grid. The two run at their own rates and are mapped by position
+     * through the measurement, which is what the rest of this file already does with them; linear
+     * between samples rather than nearest, because a step in a reference puts a step into
+     * everything it is subtracted from. */
     for (i = 0; i < n; i++) {
         double t = (double)i * (double)(naccel - 1) / (double)(n - 1);
-        int k = (int)t;
-        double f = t - k;
-        if (k >= naccel - 1) { k = naccel - 2; f = 1.0; }
-        mo[i] = accel_mag[k] * (1.0 - f) + accel_mag[k + 1] * f;
+        int q = (int)t;
+        double f = t - q;
+        if (q >= naccel - 1) { q = naccel - 2; f = 1.0; }
+        u[0][i] = accel_x[q] * (1.0 - f) + accel_x[q + 1] * f;
+        u[1][i] = accel_y[q] * (1.0 - f) + accel_y[q + 1] * f;
+        u[2][i] = accel_z[q] * (1.0 - f) + accel_z[q + 1] * f;
+    }
+    /* Velocity as well as position: a displacement and the rate of it affect the contact
+     * differently, and the two are not collinear. */
+    for (j = 0; j < 3; j++) {
+        u[3 + j][0] = 0.0;
+        for (i = 1; i < n; i++) u[3 + j][i] = u[j][i] - u[j][i - 1];
+    }
+    /* Band-limit every reference to the pulse band before fitting anything.
+     *
+     * Without this the fit is dominated by the slow swing of gravity across an axis as the arm is
+     * held differently, which is not an artefact on the pulse - the baseline interpolation already
+     * removes that - and subtracting a scaled copy of it put a large slow component *into* the
+     * signal. Measured: ac1 of 723 against 97 on the same wrist, and a rate that fell off a steady
+     * 60 to 46. The compensation was making the measurement worse, and the variance test could not
+     * see it: least squares reduces total variance by construction while wrecking the baseline the
+     * beats are actually measured against.
+     *
+     * A moving average removed is a crude high pass and the right kind of crude here - the cutoff
+     * only has to sit below the slowest pulse worth having, and it costs one pass over the array.
+     */
+    win = (int)(fs / 0.5);
+    if (win < 16) win = 16;
+    if (win > n / 4) win = n / 4;
+    for (j = 0; j < MC_REG; j++) {
+        double run = 0;
+        int lo = 0, hi = 0;
+        for (i = 0; i < n; i++) {
+            int want_lo = i - win / 2, want_hi = i + win / 2;
+            if (want_lo < 0) want_lo = 0;
+            if (want_hi > n - 1) want_hi = n - 1;
+            while (hi <= want_hi) run += u[j][hi++];
+            while (lo < want_lo) run -= u[j][lo++];
+            hp[i] = u[j][i] - run / (hi - lo);
+        }
+        for (i = 0; i < n; i++) u[j][i] = hp[i];
     }
 
-    for (i = 0; i < n; i++) m1 += mo[i];
-    m1 /= n;
-    for (i = 0; i < n; i++) u1[i] = mo[i] - m1;
-    u2[0] = 0.0;
-    for (i = 1; i < n; i++) u2[i] = mo[i] - mo[i - 1];
-    for (i = 0; i < n; i++) m2 += u2[i];
-    m2 /= n;
-    for (i = 0; i < n; i++) u2[i] -= m2;
+    for (c = 0; c < 2; c++) {
+        unsigned int *ch = c ? b : a;
+        double *frac = c ? &mcomp_frac2 : &mcomp_frac1;
+        double coef[MC_REG], mean = 0, before = 0, after = 0, tr = 0;
 
-    for (i = 0; i < n; i++) { s11 += u1[i] * u1[i]; s12 += u1[i] * u2[i]; s22 += u2[i] * u2[i]; }
-    det = s11 * s22 - s12 * s12;
-    if (!(det > 0.0) || s11 <= 0.0 || s22 <= 0.0) return;
+        for (i = 0; i < n; i++) mean += ch[i];
+        mean /= n;
 
-    {
-        unsigned int *ch[2];
-        double *frac[2];
-        int c;
-        ch[0] = a; ch[1] = b;
-        frac[0] = &mcomp_frac1; frac[1] = &mcomp_frac2;
-
-        for (c = 0; c < 2; c++) {
-            double mean = 0, b1 = 0, b2 = 0, c1, c2, before = 0, after = 0;
-            for (i = 0; i < n; i++) mean += ch[c][i];
-            mean /= n;
-            for (i = 0; i < n; i++) {
-                double x = (double)ch[c][i] - mean;
-                b1 += x * u1[i];
-                b2 += x * u2[i];
-                before += x * x;
+        /* Normal equations, with a ridge on the diagonal. Six references built from three axes and
+         * their differences are not independent - a wrist held still makes them nearly collinear -
+         * and without the ridge the solve chases noise into large opposed coefficients. */
+        for (j = 0; j < MC_REG; j++) {
+            for (k = 0; k < MC_REG; k++) {
+                double t = 0;
+                for (i = 0; i < n; i++) t += u[j][i] * u[k][i];
+                g[j][k] = t;
             }
-            c1 = (b1 * s22 - b2 * s12) / det;
-            c2 = (b2 * s11 - b1 * s12) / det;
-
-            for (i = 0; i < n; i++) {
-                double x = (double)ch[c][i] - mean - (c1 * u1[i] + c2 * u2[i]);
-                after += x * x;
+            {
+                double t = 0;
+                for (i = 0; i < n; i++) t += ((double)ch[i] - mean) * u[j][i];
+                g[j][MC_REG] = t;
             }
-            if (!(before > 0.0)) continue;
-            *frac[c] = 1.0 - after / before;
-            if (*frac[c] > 0.5 || *frac[c] < 0.0) { *frac[c] = -*frac[c]; continue; }
+            tr += g[j][j];
+        }
+        for (j = 0; j < MC_REG; j++) g[j][j] += 1e-6 * tr / MC_REG;
 
-            for (i = 0; i < n; i++) {
-                double v = (double)ch[c][i] - (c1 * u1[i] + c2 * u2[i]);
-                if (v < 0.0) v = 0.0;
-                ch[c][i] = (unsigned int)(v + 0.5);
+        /* Gauss with partial pivoting. Six by six; a library would be more code than this. */
+        for (j = 0; j < MC_REG; j++) {
+            int piv = j;
+            double mx = fabs(g[j][j]);
+            for (k = j + 1; k < MC_REG; k++)
+                if (fabs(g[k][j]) > mx) { mx = fabs(g[k][j]); piv = k; }
+            if (mx <= 0.0) return;
+            if (piv != j) for (k = j; k <= MC_REG; k++) {
+                double t = g[j][k]; g[j][k] = g[piv][k]; g[piv][k] = t;
+            }
+            for (k = j + 1; k < MC_REG; k++) {
+                double f = g[k][j] / g[j][j];
+                if (f == 0.0) continue;
+                for (i = j; i <= MC_REG; i++) g[k][i] -= f * g[j][i];
             }
         }
+        for (j = MC_REG - 1; j >= 0; j--) {
+            double t = g[j][MC_REG];
+            for (k = j + 1; k < MC_REG; k++) t -= g[j][k] * coef[k];
+            coef[j] = t / g[j][j];
+        }
+
+        for (i = 0; i < n; i++) {
+            double x = (double)ch[i] - mean, fit = 0;
+            for (j = 0; j < MC_REG; j++) fit += coef[j] * u[j][i];
+            before += x * x;
+            after  += (x - fit) * (x - fit);
+        }
+        if (!(before > 0.0)) continue;
+        *frac = 1.0 - after / before;
+
+        /* Above half, what is left is not a pulse with movement on it. Reported negative so the
+         * pass says it declined rather than saying it removed nothing. */
+        if (*frac > 0.5 || *frac < 0.0) { *frac = -fabs(*frac); continue; }
+
+        for (i = 0; i < n; i++) {
+            double fit = 0, v;
+            for (j = 0; j < MC_REG; j++) fit += coef[j] * u[j][i];
+            v = (double)ch[i] - fit;
+            if (v < 0.0) v = 0.0;
+            ch[i] = (unsigned int)(v + 0.5);
+        }
     }
+}
+
+/* The four numbers the vendor reduces a whole accelerometer FIFO to.
+ *
+ * Their algorithm keeps no axes and no time series. It folds each sample's magnitude into a Welford
+ * mean and M2 with a running min and max, classifies the result into one of six levels, and uses
+ * the level to decide when to re-baseline - never to subtract anything from the optical waveform.
+ * Reading their binary is what settled that; the three attempts at cancellation above had already
+ * settled it the hard way.
+ *
+ * These are reported and nothing more. The thresholds that turn them into a level are set by the
+ * host in their design and are not in the image, so inventing five of them here would put made-up
+ * numbers beside four measured ones. Logged across real wear they can be chosen from data instead.
+ * For scale, twenty seconds on this wrist gave per-second magnitude deviations of 47 to 102 counts
+ * while quiet, 178 to 250 while shifting about, and 474 during a deliberate move.
+ */
+static double gs_mean, gs_sd, gs_min, gs_max;
+
+static void gs_stats(void)
+{
+    double m = 0, m2 = 0, mn = 0, mx = 0;
+    int i;
+
+    gs_mean = gs_sd = gs_min = gs_max = 0.0;
+    if (naccel < 2) return;
+
+    for (i = 0; i < naccel; i++) {
+        double v = accel_mag[i], d;
+        if (i == 0) { m = mn = mx = v; continue; }
+        if (v > mx) mx = v;
+        if (v < mn) mn = v;
+        d = v - m;
+        m2 += d * d * (double)i / (double)(i + 1);
+        m  += d / (double)(i + 1);
+    }
+    gs_mean = m;
+    gs_sd = sqrt(m2 / naccel);
+    gs_min = mn;
+    gs_max = mx;
 }
 
 static int beatwise_ratio(const double *ppg, const unsigned int *a, const unsigned int *b,
@@ -2652,12 +2797,18 @@ int main(int argc, char **argv)
     gettimeofday(&t1, 0);
     elapsed = (t1.tv_sec-t0.tv_sec) + (t1.tv_usec-t0.tv_usec)/1e6;
     acc_finish();              /* sole writer of accel_mag; joined before anything reads it */
+    gs_stats();                /* the vendor's four descriptors, over the same magnitudes */
     stop_chip();
 
     /* MOTIONCOMP=1 until it has been shown to leave a still wrist alone and to help a moving one.
      * It cleans the arrays the rate is read from as well as the ratio, which is more than the
-     * saturation asked for, so it is one switch and not on by default. */
-    if (getenv("MOTIONCOMP")) motion_clean(ch1, ch2, ns);
+     * saturation asked for, so it is one switch and not on by default.
+     *
+     * The measured cadence is not available yet - it comes from the burst medians below, after the
+     * sample count has been checked - and this only needs a rate accurate enough to place a half
+     * hertz corner, so the whole pass over the whole time serves. */
+    if (getenv("MOTIONCOMP") && elapsed > 0)
+        motion_clean(ch1, ch2, ns, (double)ns / elapsed);
 
     if ((ns < 600 && !want_ratio) || ns < 200 || elapsed <= 0) {
         printf("hr=0 reason=too_few_samples samples=%d rounds=%d timeouts=%d\n",
@@ -3131,7 +3282,8 @@ int main(int argc, char **argv)
 
             printf("hr=%.0f spread=%.0f hz=%.1f samples=%d windows=%d gain=%04x"
                    " dc1=%.0f dc2=%.0f ac1=%.0f ac2=%.0f r=%.3f spo2=%.0f beats=%d raw=%.0f/%.2f sut=%.0f ai=%.2f motion=%.0f/%.0f"
-                   " conf=%.2f peaks=%d sutmed=%.0f sutmad=%.0f sutn=%d sbp=%.0f dbp=%.0f mcomp=%.3f/%.3f used=%s%s\n",
+                   " conf=%.2f peaks=%d sutmed=%.0f sutmad=%.0f sutn=%d sbp=%.0f dbp=%.0f mcomp=%.3f/%.3f"
+                   " gsmean=%.0f gssd=%.0f gsmin=%.0f gsmax=%.0f gsrange=%.0f used=%s%s\n",
                    med, spread, fs, ns, nrates, gain, dc1, dc2, a1, a2, r, spo2, shape_beats, shape_raw_sut, shape_raw_ai, sut, ai, mot_med, mot_worst,
                    /* Within two bpm, which is about what the reference itself holds to: the cuff
                     * moved between 58 and 61 across four minutes on a resting wearer, so a
@@ -3143,6 +3295,7 @@ int main(int argc, char **argv)
                    confidence_p(rates, nrates, 2.0), shape_peaks,
                    shape_sut_med, shape_sut_mad, shape_sut_n, sbp, dbp,
                    mcomp_frac1, mcomp_frac2,
+                   gs_mean, gs_sd, gs_min, gs_max, gs_max - gs_min,
                    src == ch2 ? "ch2" : "ch1",
                    /* Say so when the windows did not agree on their own and the previous rate
                     * chose between them. Worth having under motion, and not the same claim as a
