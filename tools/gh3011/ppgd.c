@@ -2853,8 +2853,7 @@ int main(int argc, char **argv)
                 } else if (getenv("FREEZEGAIN")) {
                     /* nothing */
                 } else if (want_spo2) {
-                    double lo_lvl = (dc1 < dc2 ? dc1 : dc2) - DARK_UNIT * 3.0;
-                    double hi_lvl = (dc1 > dc2 ? dc1 : dc2) - DARK_UNIT * 3.0;
+
 
                     /* Thresholds as fractions of the span, which is how Goodix states them.
                      *
@@ -2905,6 +2904,9 @@ int main(int argc, char **argv)
                      *
                      * OLDAGC=1 restores the eighth-of-the-register loop for comparison.
                      */
+                    double lo_lvl = (dc1 < dc2 ? dc1 : dc2) - DARK_UNIT * 3.0;
+                    double hi_lvl = (dc1 > dc2 ? dc1 : dc2) - DARK_UNIT * 3.0;
+
                     if (getenv("OLDAGC")) {
                         if (hi_lvl > 48000.0 && gain > 0x1000)
                             newgain = (unsigned short)(gain - (gain >> 3));
@@ -3008,8 +3010,6 @@ int main(int argc, char **argv)
                         int nhb = hb, nlb = lb;
                         double lvl1 = dc1 - DARK_UNIT * 3.0;   /* low byte drives channel 1 */
                         double lvl2 = dc2 - DARK_UNIT * 3.0;   /* high byte drives channel 2 */
-                        int step = 0;
-
                         nlb = solve_code(lb, lvl1);
                         nhb = solve_code(hb, lvl2);
                         if (nlb < GAIN_CODE_MIN) nlb = GAIN_CODE_MIN;
@@ -3018,8 +3018,7 @@ int main(int argc, char **argv)
                         if (nhb > GAIN_CODE_MAX) nhb = GAIN_CODE_MAX;
                         if (gain_changes < 24 && (nhb != hb || nlb != lb))
                             newgain = (unsigned short)((nhb << 8) | nlb);
-                        gain_dir = 0;
-                        (void)step; (void)lo_lvl; (void)hi_lvl;
+                        gain_dir = 0;   /* nothing carries between iterations any more */
                         /* And a hard stop. However the band is drawn, a loop that is still moving
                          * at the end of a pass has measured nothing, and the caller cannot tell
                          * that from a quiet wrist. After this many changes it stays where it is and
