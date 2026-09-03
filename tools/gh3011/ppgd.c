@@ -3411,6 +3411,20 @@ int main(int argc, char **argv)
             motion_summary(&mot_med, &mot_worst);
             narrow_ratio(ns, fs, med);
 
+            /* The saturation goes in spo2=, which until now was declared zero and never assigned.
+             *
+             * Two fields were carrying this and neither reached anything: spo2rel= needs a baseline
+             * the daemon builds over many measurements and in practice was never emitted, and
+             * spo2v= was mine and nothing read it. A dead spo2= sitting first in the line meant
+             * anything looking for a saturation found a zero and stopped.
+             *
+             * The gate is the vendor's own floor. Their saturation mode will not accept a pulse
+             * below thirty-four counts, and under that a single ADC count moves the ratio further
+             * than a six point desaturation does. Both channels have to clear it, and when they do
+             * not the field stays zero and the reader falls through as it always did.
+             */
+            if (a1 >= 34.0 && a2 >= 34.0) spo2 = vendor_spo2(r);
+
             /* No percentage. R is printed because it is a real measurement and worth watching;
              * turning it into a saturation is what there is no basis for.
              *
@@ -3482,7 +3496,7 @@ int main(int argc, char **argv)
                    " dc1=%.0f dc2=%.0f ac1=%.0f ac2=%.0f r=%.3f spo2=%.0f beats=%d raw=%.0f/%.2f sut=%.0f ai=%.2f motion=%.0f/%.0f"
                    " conf=%.2f peaks=%d sutmed=%.0f sutmad=%.0f sutn=%d sbp=%.0f dbp=%.0f mcomp=%.3f/%.3f"
                    " gsmean=%.0f gssd=%.0f gsmin=%.0f gsmax=%.0f gsrange=%.0f"
-                   " nb1=%.1f nb2=%.1f rband=%.3f spo2v=%.1f used=%s%s\n",
+                   " nb1=%.1f nb2=%.1f rband=%.3f used=%s%s\n",
                    med, spread, fs, ns, nrates, gain, dc1, dc2, a1, a2, r, spo2, shape_beats, shape_raw_sut, shape_raw_ai, sut, ai, mot_med, mot_worst,
                    /* Within two bpm, which is about what the reference itself holds to: the cuff
                     * moved between 58 and 61 across four minutes on a resting wearer, so a
@@ -3495,7 +3509,6 @@ int main(int argc, char **argv)
                    shape_sut_med, shape_sut_mad, shape_sut_n, sbp, dbp,
                    mcomp_frac1, mcomp_frac2,
                    gs_mean, gs_sd, gs_min, gs_max, gs_max - gs_min, nb_a1, nb_a2, nb_r,
-                   vendor_spo2(r),
                    src == ch2 ? "ch2" : "ch1",
                    /* Say so when the windows did not agree on their own and the previous rate
                     * chose between them. Worth having under motion, and not the same claim as a

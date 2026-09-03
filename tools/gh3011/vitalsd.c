@@ -905,15 +905,17 @@ static void measure(const char *mode, char *out, size_t outsz)
                      med, sp, n3);
         }
 
-        /* Only a pass that cleared both gates gets to move the reading, and only once there is
-         * a baseline to move it against. */
-        if (rm > 0.05 && rm < 5.0 && beats >= 8 && rsp >= 0 && rsp < 0.35) {
-            double sat = 0;
-            if (spo2_from_baseline(rm, &sat)) {
-                size_t at3 = strlen(ratio_out);
-                snprintf(ratio_out + at3, ratio_sz - at3, " spo2rel=%.0f", sat);
-            }
-        }
+        /* spo2rel is no longer emitted.
+         *
+         * It was a movement away from this sensor's own recent baseline, anchored on an assumption
+         * about a healthy adult at rest, and it needed a baseline built over many measurements
+         * before it would appear at all. In practice it did not appear: a live reply reads
+         *     hr=60 ac1=117 ac2=117 r=1.015 spo2=0
+         * with no spo2rel in it, so nothing was ever published and the chart stayed empty while
+         * this file and the launcher both carried careful notes about how to read it.
+         *
+         * The saturation now goes in spo2=, from the vendor's own curve, gated on their own
+         * amplitude floor. One field, computed one way, in the place a reader would look. */
 
         /* And the vendor's own curve, where the pulse is big enough to carry it.
          *
