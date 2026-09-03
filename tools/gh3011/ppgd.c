@@ -69,6 +69,23 @@ struct rdwr { struct msg *msgs; int n; };
  */
 #define DARK_UNIT 1048576.0
 
+/* The code a channel reads when it clips.
+ *
+ * Measured, not derived: every railed run reports dc2 as 3,210,580 to within a count or two, and
+ * raw dumps show two thirds of the samples sitting exactly there. Less the three-unit pedestal it
+ * leaves a span of 64,852 codes, which is what the gain loop steers within.
+ */
+#define RAIL_CODE 3210580.0
+
+/* The gain codes 0x0118 is walked between, one byte per channel.
+ *
+ * The start sequence uses 0x9055 and 0x2828 and the vendor's own loop runs up to 0x564c, so 0x90
+ * is a value the part is known to accept. The floor is well below anything either side has been
+ * seen at and is there to stop the loop walking into a corner it cannot see out of.
+ */
+#define GAIN_CODE_MIN 0x0a
+#define GAIN_CODE_MAX 0x90
+
 static double dark_for(double dc)
 {
     double units = floor(dc / DARK_UNIT);
@@ -2294,10 +2311,53 @@ int main(int argc, char **argv)
                      * band below was found by measurement on this watch and settles at 23,547 and
                      * 24,559 with a physiological ratio, which is what matters.
                      */
-                    if (hi_lvl > 48000.0 && gain > 0x1000)
-                        newgain = (unsigned short)(gain - (gain >> 3));   /* the bright one clips */
-                    else if (lo_lvl < 12000.0 && gain < 0xe000)
-                        newgain = (unsigned short)(gain + (gain >> 3));   /* the faint one is dark */
+                    /* Steer the stronger channel into the band, one gain code at a time.
+                     *
+                     * Two things were wrong here and they compounded.
+                     *
+                     * The band was a dead zone rather than a target: anything with the weak channel
+                     * above 12,000 and the strong one below 48,000 was accepted, which is most of
+                     * the range. And the step was an eighth of the whole 16-bit register, which is
+                     * not one gain step but five - 0x2828 to 0x2323 takes five codes off each byte.
+                     * Measured, that single move took the level from clipping to 20,617, a factor
+                     * of 3.1, so one code is worth about 25% and the loop was moving in fives.
+                     *
+                     * Together they gave the behaviour the raw dumps show: channel 2 is railed from
+                     * the first sample of every run, the loop clears the rail on its first step,
+                     * overshoots to 31% of span, finds itself inside the dead zone and stops. With
+                     * a four-count pulse, every time, which is what the wandering ratio was.
+                     *
+                     * So step one code at a time - two while still clipping, to get down quickly -
+                     * and put both rules on the same channel. Goodix hold a channel between half
+                     * and nine tenths of the span and steer to seven tenths. Putting the floor on
+                     * the weak channel and the ceiling on the strong one is what was tried before,
+                     * and it fought itself: raising the weak channel clips the strong one, the clip
+                     * rule is tested first and wins, and the gain walks down to 0x0f67 with nothing
+                     * left. Two rules on one channel cannot fight.
+                     *
+                     * OLDAGC=1 restores the eighth-of-the-register loop for comparison.
+                     */
+                    if (getenv("OLDAGC")) {
+                        if (hi_lvl > 48000.0 && gain > 0x1000)
+                            newgain = (unsigned short)(gain - (gain >> 3));
+                        else if (lo_lvl < 12000.0 && gain < 0xe000)
+                            newgain = (unsigned short)(gain + (gain >> 3));
+                    } else {
+                        double span = RAIL_CODE - DARK_UNIT * 3.0;   /* the rail, less pedestal */
+                        int step = 0;
+                        if (hi_lvl >= span * 0.98)      step = -2;   /* clipping: get off it */
+                        else if (hi_lvl > span * 0.88)  step = -1;
+                        else if (hi_lvl < span * 0.55)  step = 1;
+                        if (step) {
+                            int hb = (gain >> 8) & 0xff, lb = gain & 0xff;
+                            hb += step; lb += step;
+                            if (hb < GAIN_CODE_MIN) hb = GAIN_CODE_MIN;
+                            if (lb < GAIN_CODE_MIN) lb = GAIN_CODE_MIN;
+                            if (hb > GAIN_CODE_MAX) hb = GAIN_CODE_MAX;
+                            if (lb > GAIN_CODE_MAX) lb = GAIN_CODE_MAX;
+                            newgain = (unsigned short)((hb << 8) | lb);
+                        }
+                    }
                 } else if (gain > 0x1000 &&
                     (dc1 > 3200000.0 || (want_spo2 && dc2 > 3200000.0)))
                     newgain = (unsigned short)(gain - (gain >> 3));   /* back off about 12% */
