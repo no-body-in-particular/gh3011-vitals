@@ -99,6 +99,46 @@ static double dark_for(double dc)
  * to revisit if saturation ever reads implausibly. */
 #define R_REST 0.35
 
+/* The vendor's saturation curve for this watch, and what our ratio has to be divided by to use it.
+ *
+ * The curve is not fitted here. It is the host parameter block their daemon hands the library -
+ * ids 0x2030 to 0x2035, three 32-bit values at a scale of ten thousand - overriding coefficients
+ * whose defaults, 0.0, -25.0 and 110.0, are three floats in their binary.
+ *
+ * The divisor is measured, and measured twice. Their daemon and ours were run on the same wrist
+ * minutes apart, theirs driven into saturation mode by hand because nothing on this watch has ever
+ * asked it for one:
+ *
+ *     theirs 98%  -> their R 0.4959   ours 1.0490 (three runs)   ratio 2.115
+ *     theirs 97%  -> their R 0.5275   ours 0.9907 (three runs)   ratio 1.878
+ *
+ * Two is within both. Through their curve at half, our ratios give 97.1% where they said 98 and
+ * 98.0% where they said 97 - a point out either way, in opposite directions, which is the twelve
+ * percent between the two ratios showing up as two points of saturation.
+ *
+ * So this is worth about a point, on two comparisons a single percent of saturation apart. That is
+ * enough to log and watch and nowhere near enough to publish: a curve is only tested by a
+ * saturation that moves, and neither of those measurements had one. This file has published a
+ * confident 86% before, off a ratio that turned out to be two counts divided by itself, and the
+ * note that followed warned against exactly this arithmetic. What has changed since is that the
+ * ratio is now repeatable to a couple of percent and their number is on the table beside it, which
+ * is why it is computed at all rather than why it should be believed.
+ */
+#define VENDOR_SPO2_A   (-1.0223)
+#define VENDOR_SPO2_B   (-30.5835)
+#define VENDOR_SPO2_C   (113.4171)
+#define VENDOR_R_DIVISOR 2.0
+
+static double vendor_spo2(double r_ours)
+{
+    double r = r_ours / VENDOR_R_DIVISOR;
+    double s;
+    if (!(r > 0.0)) return 0.0;
+    s = VENDOR_SPO2_A * r * r + VENDOR_SPO2_B * r + VENDOR_SPO2_C;
+    if (s > 100.0) s = 100.0;
+    return s < 50.0 ? 0.0 : s;
+}
+
 static int fd = -1;
 static void on_alarm(int s) { (void)s; }        /* no SA_RESTART: unblocks a stuck wait */
 
@@ -3344,7 +3384,7 @@ int main(int argc, char **argv)
                    " dc1=%.0f dc2=%.0f ac1=%.0f ac2=%.0f r=%.3f spo2=%.0f beats=%d raw=%.0f/%.2f sut=%.0f ai=%.2f motion=%.0f/%.0f"
                    " conf=%.2f peaks=%d sutmed=%.0f sutmad=%.0f sutn=%d sbp=%.0f dbp=%.0f mcomp=%.3f/%.3f"
                    " gsmean=%.0f gssd=%.0f gsmin=%.0f gsmax=%.0f gsrange=%.0f"
-                   " nb1=%.1f nb2=%.1f rband=%.3f used=%s%s\n",
+                   " nb1=%.1f nb2=%.1f rband=%.3f spo2v=%.1f used=%s%s\n",
                    med, spread, fs, ns, nrates, gain, dc1, dc2, a1, a2, r, spo2, shape_beats, shape_raw_sut, shape_raw_ai, sut, ai, mot_med, mot_worst,
                    /* Within two bpm, which is about what the reference itself holds to: the cuff
                     * moved between 58 and 61 across four minutes on a resting wearer, so a
@@ -3357,6 +3397,7 @@ int main(int argc, char **argv)
                    shape_sut_med, shape_sut_mad, shape_sut_n, sbp, dbp,
                    mcomp_frac1, mcomp_frac2,
                    gs_mean, gs_sd, gs_min, gs_max, gs_max - gs_min, nb_a1, nb_a2, nb_r,
+                   vendor_spo2(r),
                    src == ch2 ? "ch2" : "ch1",
                    /* Say so when the windows did not agree on their own and the previous rate
                     * chose between them. Worth having under motion, and not the same claim as a
