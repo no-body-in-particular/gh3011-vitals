@@ -118,28 +118,6 @@ static double dark_for(double dc)
  */
 #define SETTLE_SECS 3.0
 
-/* 0x0136, and why it must never be written as zero for a saturation.
- *
- * This is the register that makes the two channels a wavelength pair. The shipped configuration
- * leaves it at zero; Goodix's reference saturation array sets 0x0110; and that is the whole
- * difference between having a ratio and not having one:
- *
- *     0x0000   ac1 85, 134, 84     ac2 83, 125, 82    ratio ~1.0   R 0.964, 1.009, 0.970
- *     0x0110   ac1 103, 105, 101   ac2 227, 228, 227  ratio  2.2   R 0.482, 0.486, 0.471
- *
- * And this code was erasing it. All four places that write 0x0118 wrote 0x0136 = 0 immediately
- * first - copied from the vendor's own trace, which pairs the two writes that way - so an override
- * survived only until the current loop next moved. That is why short passes read a hundred counts
- * and a hundred-and-ten-second capture collapsed from seventy counts to eleven, five seconds in:
- * the loop stepped, and the pair went away.
- *
- * That the vendor pairs those writes is consistent with their own saturation being broken for this
- * same reason, and with them shipping it disabled behind a flag.
- *
- * Zero for the rate, which is green, single-channel, and wants nothing here.
- */
-#define LED_DRIVE_SPO2 0x0110
-
 
 
 static int fd = -1;
@@ -2454,31 +2432,6 @@ int main(int argc, char **argv)
         }
 
 
-    /* The pairing, written where the command-line override used to land - and that position is the
-     * whole of it.
-     *
-     * 0x0136 makes the two channels a wavelength pair: zero in the shipped configuration, 0x0110 in
-     * Goodix reference array, and the difference between ac2/ac1 of 1.0 and of 2.2.
-     *
-     * It has to go here, before the block below that sets the first LED current, and it has to be
-     * committed. Everything else was tried:
-     *
-     *   written at every 0x0118 write     light comes up so far the loop walks to its floor of
-     *                                     0x0a0a and the ratio reads 1.33
-     *   written once after that block      loop settles at 0x3f3f but the pairing never takes:
-     *                                     ac2/ac1 back to 1.0 and the ratio to 1.01
-     *   written once here, committed       loop settles at 0x4343 and the ratio at 0.47
-     *
-     * The odd part, and worth knowing before moving this again: the block below then writes
-     * 0x0136 = 0 immediately, and the current loop writes it again on every adjustment, and the
-     * pairing holds regardless. So this is a one-shot that configures the channels, not a level to
-     * be maintained - which is why writing it more often made it worse rather than better.
-     */
-    if (want_spo2) {
-        wr16(0x0136, LED_DRIVE_SPO2);
-        wr8(0xdddd, 0xc1);
-        usleep(50000);
-    }
 
         if (argc > 4 && argv[4][0]) {
             const char *p = argv[4];
