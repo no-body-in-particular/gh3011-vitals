@@ -172,7 +172,17 @@ static double dark_for(double dc)
 #define VENDOR_SPO2_A   (-1.0223)
 #define VENDOR_SPO2_B   (-30.5835)
 #define VENDOR_SPO2_C   (113.4171)
-#define VENDOR_R_DIVISOR 2.0
+/* One, now that the pairing is configured.
+ *
+ * This was 2.0, fitted against their daemon while 0x0136 was zero and our ratio was pinned near 1,
+ * and it was argued up to 3.6 at one point. Both numbers were compensating for the register. With
+ * the pairing active our ratio is theirs: 0.469 to 0.594 measured here against their 0.496 for the
+ * 98 percent a finger meter agrees with, so their curve applies directly and the divisor is one.
+ *
+ * Kept as a named constant rather than deleted because the whole history of this file argues it
+ * will need looking at again.
+ */
+#define VENDOR_R_DIVISOR 1.0
 
 static double vendor_spo2(double r_ours)
 {
@@ -2496,6 +2506,32 @@ int main(int argc, char **argv)
         }
 
 
+    /* The pairing, written where the command-line override used to land - and that position is the
+     * whole of it.
+     *
+     * 0x0136 makes the two channels a wavelength pair: zero in the shipped configuration, 0x0110 in
+     * Goodix reference array, and the difference between ac2/ac1 of 1.0 and of 2.2.
+     *
+     * It has to go here, before the block below that sets the first LED current, and it has to be
+     * committed. Everything else was tried:
+     *
+     *   written at every 0x0118 write     light comes up so far the loop walks to its floor of
+     *                                     0x0a0a and the ratio reads 1.33
+     *   written once after that block      loop settles at 0x3f3f but the pairing never takes:
+     *                                     ac2/ac1 back to 1.0 and the ratio to 1.01
+     *   written once here, committed       loop settles at 0x4343 and the ratio at 0.47
+     *
+     * The odd part, and worth knowing before moving this again: the block below then writes
+     * 0x0136 = 0 immediately, and the current loop writes it again on every adjustment, and the
+     * pairing holds regardless. So this is a one-shot that configures the channels, not a level to
+     * be maintained - which is why writing it more often made it worse rather than better.
+     */
+    if (want_spo2) {
+        wr16(0x0136, LED_DRIVE_SPO2);
+        wr8(0xdddd, 0xc1);
+        usleep(50000);
+    }
+
         if (argc > 4 && argv[4][0]) {
             const char *p = argv[4];
             while (*p) {
@@ -2592,21 +2628,6 @@ int main(int argc, char **argv)
             usleep(50000);
         }
     }
-
-    /* And the pairing, written once, after the start sequence and before sampling begins.
-     *
-     * It has to be exactly here. Written earlier - in the slot block, or beside the first current
-     * write - the light level comes up so far that the current loop walks to its floor of 0x0a0a
-     * and the ratio lands at 1.33. Written once at this point, which is where the command-line
-     * override used to land, the loop settles at 0x4343 and the ratio at 0.47.
-     *
-     * The current loop still writes 0x0136 = 0 on every adjustment and that is deliberately left
-     * alone: in the runs that worked the register was zero for most of the pass and the pairing held
-     * anyway, so this behaves as a one-shot that configures the channels rather than a level needing
-     * to be maintained. Same lesson as the rail and the pinned current - on this part the order of
-     * writes carries as much as their values.
-     */
-    if (want_spo2) wr16(0x0136, LED_DRIVE_SPO2);
 
     acc_start();               /* the accelerometer, at a rate that can describe movement */
     gettimeofday(&t0, 0);
