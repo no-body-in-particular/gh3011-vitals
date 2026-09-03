@@ -117,12 +117,25 @@ static double dark_for(double dc)
  * percent between the two ratios showing up as two points of saturation.
  *
  * So this is worth about a point, on two comparisons a single percent of saturation apart. That is
- * enough to log and watch and nowhere near enough to publish: a curve is only tested by a
- * saturation that moves, and neither of those measurements had one. This file has published a
- * confident 86% before, off a ratio that turned out to be two counts divided by itself, and the
- * note that followed warned against exactly this arithmetic. What has changed since is that the
- * ratio is now repeatable to a couple of percent and their number is on the table beside it, which
- * is why it is computed at all rather than why it should be believed.
+ * enough to log and watch and nowhere near enough to publish.
+ *
+ * AND THEN THE RATIO IT WAS FITTED TO TURNED OUT TO BE WRONG. Both comparisons above were taken
+ * while the gain loop was hunting - see the deadband note further down - and a gain change puts a
+ * DC step of some 9,500 counts into both channels at once, two orders above the pulse and common to
+ * the pair, which drives the amplitude ratio towards one. That is why R sat so convincingly near
+ * 1.000 and why it was so repeatable: it was measuring the gain loop, not the blood.
+ *
+ * With the gain held still, on the same wrist within the hour, R reads 1.78 to 1.94 across six
+ * passes with ac1/ac2 near 1.85. Against their 0.496 that is a divisor near 3.6, not 2.0.
+ *
+ * The divisor below is therefore stale and spo2v computed from it is not to be believed. It is left
+ * at 2.0 rather than quietly moved to 3.6, because 3.6 would be fitted to their reading taken
+ * through the same broken loop, and replacing one number derived from contaminated data with
+ * another is not progress. The paired comparison has to be run again against a settled gain.
+ *
+ * This file has published a confident 86% before, off a ratio that turned out to be two counts
+ * divided by itself. This is the second time a ratio here has been steady, plausible, repeatable
+ * and an artefact of the code measuring it.
  */
 #define VENDOR_SPO2_A   (-1.0223)
 #define VENDOR_SPO2_B   (-30.5835)
@@ -1966,6 +1979,9 @@ int main(int argc, char **argv)
     int nburst = 0;
     unsigned short gain = 0x9055;   /* the value the start sequence applies */
     int settled_at = 0;             /* first sample after the gain stopped moving */
+    unsigned short gainfix = 0;     /* GAINFIX: pin the gain once the loop has unclipped the part */
+    int gain_locked = 0;
+    int gain_changes = 0;           /* a loop still moving at the end has measured nothing */
     /* What the rate was last time, if the caller knows. Only used to break a tie between two
      * candidate clusters under motion; never to nudge an answer that stood on its own. */
     double prev_bpm = 0.0;
@@ -1978,6 +1994,7 @@ int main(int argc, char **argv)
      * replace. */
     const char *mode = argc > 3 ? argv[3] : "";
     { const char *pb = getenv("PREV_BPM"); if (pb) prev_bpm = atof(pb); }
+    { const char *gf = getenv("GAINFIX"); if (gf) gainfix = (unsigned short)strtol(gf, 0, 0); }
     int want_ratio = (strcmp(mode, "ratio") == 0);
     int want_redo  = (strcmp(mode, "redo") == 0);
     /*
@@ -2680,7 +2697,26 @@ int main(int argc, char **argv)
                  * place for a wrist like this one. Adapting gets there too and keeps the headroom
                  * when a wrist is darker or brighter than the one this was tuned on.
                  */
-                if (getenv("FREEZEGAIN")) {
+                /* GAINFIX=<code>: let the loop settle, then pin the gain there for the rest of
+                 * the pass, so consecutive passes can be compared at one gain.
+                 *
+                 * FREEZEGAIN cannot do this. The part comes out of the start sequence clipped on
+                 * channel 2 and only a write made while the stream is running brings it off, so
+                 * freezing from the first sample holds it against the rail for the whole pass -
+                 * which is what every frozen run in this file has measured. Letting the loop work
+                 * for a few seconds first and then pinning gives an unclipped part at a known code.
+                 *
+                 * The question it exists to answer: R splits by settled gain, 1.132 against 1.040,
+                 * and the split is entirely in ac1/ac2 at identical light levels. If that split
+                 * survives with the gain held equal across passes then the gain was never the
+                 * cause and it was standing in for something else.
+                 */
+                if (gainfix && !gain_locked && elapsed > 6.0) {
+                    newgain = gainfix;
+                    gain_locked = 1;
+                } else if (gain_locked) {
+                    /* nothing: pinned for the rest of the pass */
+                } else if (getenv("FREEZEGAIN")) {
                     /* nothing */
                 } else if (want_spo2) {
                     double lo_lvl = (dc1 < dc2 ? dc1 : dc2) - DARK_UNIT * 3.0;
@@ -2763,12 +2799,37 @@ int main(int argc, char **argv)
                          * seconds, reaching 0x3a3a with the level at 34,000 and short of their
                          * floor. Each change restarts the analysis window, so converging sooner is
                          * also more of the pass spent measuring. */
+                        /* A deadband, because their floor is a floor and not a target.
+                         *
+                         * Raising whenever the level was under 40000 made the loop hunt. It settles
+                         * around 40,772 on this wrist, a few hundred counts the wrong side of the
+                         * threshold, and one code is worth about a quarter of the level - so it
+                         * stepped up, overshot, drifted back under, and stepped again, for as long
+                         * as the pass lasted. Every change restarts the analysis window, so a thirty
+                         * second pass ended with nothing settled in it: three adaptive passes in a
+                         * row reported dc1=0 while three pinned ones between them read normally.
+                         *
+                         * Worse than losing the pass, a change inside the window puts a DC step of
+                         * about 9,500 counts into both channels at once - two orders above the
+                         * pulse, and common to the pair, which drives the amplitude ratio towards
+                         * one. That is the likeliest reason R sat so near 1.000 for so long.
+                         *
+                         * So: only move when the level is genuinely outside the band, and stop
+                         * moving once it is inside. Their 40000 is where the loop should aim when
+                         * it has to move at all, not the edge at which it starts moving.
+                         */
                         int step = 0;
                         if (hi_lvl >= 60000.0)      step = -2;   /* at the rail: get off it */
                         else if (hi_lvl > 58000.0)  step = -1;
-                        else if (hi_lvl < 30000.0)  step = 2;
-                        else if (hi_lvl < 40000.0)  step = 1;
+                        else if (hi_lvl < 26000.0)  step = 2;
+                        else if (hi_lvl < 34000.0)  step = 1;
                         if (step == 0 && lo_lvl < 10000.0) step = 1;  /* the faint one needs it too */
+
+                        /* And a hard stop. However the band is drawn, a loop that is still moving
+                         * at the end of a pass has measured nothing, and the caller cannot tell
+                         * that from a quiet wrist. After this many changes it stays where it is and
+                         * the rest of the pass is at least analysable. */
+                        if (gain_changes >= 12) step = 0;
                         if (step) {
                             int hb = (gain >> 8) & 0xff, lb = gain & 0xff;
                             hb += step; lb += step;
@@ -2868,6 +2929,7 @@ int main(int argc, char **argv)
                      * moving; including the transient put the estimate at the edge of its
                      * search range. */
                     settled_at = ns;
+                    gain_changes++;
                     gain = newgain;
                     wr16(0x0136, 0x0000);
                     wr16(0x0118, gain);
