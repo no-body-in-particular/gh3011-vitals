@@ -118,6 +118,20 @@ static double dark_for(double dc)
  */
 #define SETTLE_SECS 3.0
 
+/* How far back to look for the foot of a beat.
+ *
+ * This was a third of a beat, which makes the window a function of the heart rate and lets the
+ * answer follow it: at 52 bpm the upstroke measured 160 to 241 ms and at 46 it measured 391,
+ * on the same wrist within the hour. A third of a beat is 441 ms at 46 bpm, so the search had
+ * room to wander that far and the largest second difference in it is not the foot.
+ *
+ * The quantity has a physiological range and the gate below states it: 40 to 300 ms. Searching
+ * a little past the top of that range is all that is needed, and it means the same window is
+ * examined whatever the rate - which is the only way two measurements minutes apart can be
+ * compared. Anything genuinely slower than this is outside the gate anyway.
+ */
+#define FOOT_SEARCH_SECS 0.35
+
 /* When the gain stops moving, whether or not it ever moved.
  *
  * SETTLE_SECS is measured from the last gain change, so a pass in which the gain never changed
@@ -1660,7 +1674,7 @@ static double beat_sut(const double *w, int wlen, int pre, double fs, double T)
     int k, foot = -1, lo;
     double best = -1e18;
 
-    lo = pre - (int)(T * 0.34);
+    lo = pre - (int)(fs * FOOT_SEARCH_SECS);
     if (lo < 1) lo = 1;
     for (k = pre - 2; k > lo; k--) {
         double d2 = w[k-1] - 2.0 * w[k] + w[k+1];
@@ -1929,7 +1943,7 @@ static void pulse_shape(const double *d, int n, double fs, double bpm, double *s
          * Twenty milliseconds because an upstroke runs 100 to 300, so this is short enough to
          * locate its start and long enough to sit above the sample-to-sample noise.
          */
-        lo = pre - (int)(T * 0.34);
+        lo = pre - (int)(fs * FOOT_SEARCH_SECS);
         if (lo < 1) lo = 1;
         for (k = pre - 2; k > lo; k--) {
             double d2 = ens[k-1] - 2.0 * ens[k] + ens[k+1];
