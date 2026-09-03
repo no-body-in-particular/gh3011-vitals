@@ -1981,14 +1981,20 @@ int main(int argc, char **argv)
          */
         /* Their 0x0100 block, written at the rate it was captured at.
          *
-         * Diffing their running chip against ours, every register matched but one: 0x0100 holds
-         * f530 for them and ea60 for us - exactly 60000, so the part is clamping what we write.
-         * It clamps against the sample rate, and the rate is what differs when the write lands.
-         * Their sequence writes the whole 0x0100 block first and only then sets 0x0016 to 0147;
-         * ours is already at 0147 from the previous pass, so the same value will not fit.
+         * The reading below is right and the explanation of it is wrong. 0x0100 does hold f530 for
+         * them and ea60 for us, confirmed three dumps running on each side while both were
+         * measuring. But the order was never the difference: taken from the wire, both write
+         * 0x0100 = f530 and then 0x0016 = 0147, one write each, in that order, and the rate reads
+         * back 0147 on both sides while they run.
          *
-         * So drop to 25 Hz, write the block, and put the rate back. The values are theirs and
-         * were never the problem - the order was.
+         * Nor is it the trailing slot block below - NOVENDORSLOTS=1 removes it and 0x0100 still
+         * reads ea60 - and nor does it follow the gain, which was the next guess: frozen at
+         * 0x2828, 0x4f44 and 0x1414 it reads ea60 every time. As signed values ours is exactly
+         * twice theirs, -5536 against -2768, which is suggestive and so far nothing more.
+         *
+         * So this remains the one configuration register the two sides disagree on and the reason
+         * is not known. What is known is that it is not the reason the ratio was wandering; that
+         * was amplitude, and the note on the saturation gain has it.
          */
         /* Off unless asked for, because written here it breaks the stream.
          *

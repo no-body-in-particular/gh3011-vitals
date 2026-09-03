@@ -46,6 +46,7 @@ Every measurement is appended to `/sdcard/vitals.log` with its full field set.
     tools/gh3011/ppgd.c        the measurement itself, and everything that reads a waveform
     tools/gh3011/adtwear.c     the chip's own wear detector
     tools/gh3011/ghcmd.c       sends the vendor daemon a command, for measuring ours against theirs
+    tools/gh3011/regdump.c     reads the part's registers while it runs, echo-proof, changing nothing
     tools/gh3011/seq.h         the start sequence, generated from a capture of the vendor daemon
     tools/gh3011/adt_table.h   the auto-detect configuration, read out of the vendor binary
     docs/gh3011.md             the chip: registers, commands, and how a reading is taken
@@ -58,6 +59,7 @@ An Android NDK arm32 toolchain, and nothing else:
     armv7a-linux-androideabi19-clang -Os -Wall -o vitalsd vitalsd.c
     armv7a-linux-androideabi19-clang -Os -Wall -o adtwear adtwear.c
     armv7a-linux-androideabi19-clang -Os -Wall -o ghcmd ghcmd.c
+    armv7a-linux-androideabi19-clang -Os -Wall -o regdump regdump.c
 
 `tools/gh3011/install-vitalsd.sh` puts them on the watch and takes over the init slot. It keeps
 the vendor daemon at `gh3011_service.real` so the swap is one `cat` in either direction.
