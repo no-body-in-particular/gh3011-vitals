@@ -118,6 +118,30 @@ static double dark_for(double dc)
  */
 #define SETTLE_SECS 3.0
 
+/* When the gain stops moving, whether or not it ever moved.
+ *
+ * SETTLE_SECS is measured from the last gain change, so a pass in which the gain never changed
+ * has nothing to measure from and analyses from its first sample - including the seconds after
+ * the start sequence, where the part is still coming to rest and where the 1 Hz cadence lives.
+ * That is not a rare case: the chip keeps 0x0118 between runs, so a pass that opens near the
+ * band never touches the gain at all.
+ *
+ * It is the whole difference between the two pass lengths this is asked for. A 22-second pass,
+ * the one the daemon requests, left the gain alone, analysed all 2,300 samples and read 60 bpm
+ * against a cuff's 47; a 26-second pass on the same wrist minutes later moved the gain once,
+ * dropped its opening, and read 47. Same binary, same wrist - the only difference was whether
+ * anything had happened to reset the window.
+ */
+#define GAIN_PIN_SECS 8.0
+
+/* First sample worth analysing: after the gain settled, and never before it was locked. */
+static int analysis_start(int settled_at, double fs)
+{
+    int s = settled_at + (int)(fs * SETTLE_SECS);
+    int lead = (int)(fs * GAIN_PIN_SECS);
+    return s > lead ? s : lead;
+}
+
 
 
 static int fd = -1;
@@ -2728,7 +2752,7 @@ int main(int argc, char **argv)
                  * watch and eight leaves margin on a darker wrist, while still leaving the greater
                  * part of a pass to measure in.
                  */
-                if (!gain_locked && elapsed >= 8.0) gain_locked = 1;
+                if (!gain_locked && elapsed >= GAIN_PIN_SECS) gain_locked = 1;
 
                 if (gainfix && !gain_locked && elapsed > 6.0) {
                     newgain = gainfix;
@@ -3034,7 +3058,7 @@ int main(int argc, char **argv)
      * nothing that needs a settled rate. */
     if (want_ratio) {
         double d1 = 0, d2 = 0, l1, l2, a1 = 0, a2 = 0, r = 0, bpm, best = 0, bestf = 0;
-        int k, skip = settled_at + (int)(fs * SETTLE_SECS);
+        int k, skip = analysis_start(settled_at, fs);
         int n = ns - skip;
 
         if (n < 200 || fs <= 0) {
@@ -3104,7 +3128,7 @@ int main(int argc, char **argv)
      * why three runs on a 65-70 bpm wearer returned 58, 46 and 42. */
     {
         /* Drop the settling period, plus a second for the baseline filter to fill. */
-        int skip = settled_at + (int)(fs * SETTLE_SECS);
+        int skip = analysis_start(settled_at, fs);
         if (skip > 0 && ns - skip > (int)(fs * 12)) {
             memmove(ch1, ch1 + skip, (ns - skip) * sizeof ch1[0]);
             memmove(ch2, ch2 + skip, (ns - skip) * sizeof ch2[0]);
@@ -3121,8 +3145,14 @@ int main(int argc, char **argv)
          * Measured on one recording: quietest-first found nothing, this finds 63, 63, 63 bpm
          * against a wearer counting 65-70. */
         int win = (int)(fs * 10), step = win / 4, s;
+        /* Start where every other measurement here starts. This loop alone ran from the first
+         * sample, so on a pass that never moved the gain it read the settling opening as though
+         * it were pulse - which is what kept reporting 60 bpm from a wrist a cuff had at 47. If
+         * the pass is too short to fit a window after the lead-in, take what there is. */
+        int s0 = analysis_start(settled_at, fs);
+        if (s0 + win >= ns) s0 = 0;
 
-        for (s = 0; s + win < ns && nrates < 64; s += step) {
+        for (s = s0; s + win < ns && nrates < 64; s += step) {
             double conf = 0;
             double bpm = period_bpm(d + s, win, fs, &conf);
             /* 0.04, not 0.20. The pulse here is tens of counts on a drifting baseline, so a
@@ -3192,7 +3222,7 @@ int main(int argc, char **argv)
                  * transient and calls it a pulse - which is how a first attempt reported an
                  * amplitude of 3900 on a channel that carries 5. */
                 double q1 = 0, q2 = 0, e1 = 0, e2 = 0;
-                int qi, qs = settled_at + (int)(fs * SETTLE_SECS), qn = ns - qs;
+                int qi, qs = analysis_start(settled_at, fs), qn = ns - qs;
                 if (qn > 32) {
                     for (qi = qs; qi < ns; qi++) { q1 += ch1[qi]; q2 += ch2[qi]; }
                     q1 /= qn; q2 /= qn;

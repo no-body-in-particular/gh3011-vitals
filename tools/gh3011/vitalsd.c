@@ -63,7 +63,7 @@
  * blamed on 0x0180 leaking out of the ratio pass; running the ratio pass first by hand, with and
  * without NOBALANCE, does not reproduce it and duration does, every time.
  */
-#define SECS_SPO2 "22"
+#define SECS_SPO2 "32"   /* the rate needs several ten-second windows after the lead-in */
 /* The balanced pass. The vendor spends about eight seconds here and we did too, but eight is
  * not enough on this sensor: four runs at 8 s gave R of 1.048, 0.907, 0.751 and 0.782, and the
  * same wrist at 25 s gave 0.877, 0.841 and 0.741 - half the spread. The extra seventeen seconds
