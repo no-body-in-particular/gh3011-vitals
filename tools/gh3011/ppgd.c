@@ -1922,12 +1922,25 @@ static void pulse_shape(const double *d, int n, double fs, double bpm, double *s
         a  = (ens[refl] - ens[foot]) / amp;
 
         /* The gate catches a misdetected foot, not an unusual wearer. 300 ms because this one has
-         * Ehlers-Danlos: more compliant arteries and a slower upstroke are what that predicts. */
+         * Ehlers-Danlos: more compliant arteries and a slower upstroke are what that predicts.
+         *
+         * The floor was 80 ms and that was wrong at the other end. A normal systolic upstroke runs
+         * about 50 to 100 ms; it is a *delayed* upstroke that means something, pulsus tardus in
+         * aortic stenosis being the textbook case. So 80 ms cut into the normal range rather than
+         * bounding it, and once the gain override came off and the beats started agreeing, every
+         * measurement landed at 50 to 70 and was thrown away - max-second-difference foot, minimum
+         * foot, aligned and unaligned all agreeing on it.
+         *
+         * The 130 to 271 ms readings this floor was drawn around were not the good ones. They came
+         * from a weak signal whose beats disagreed by ninety milliseconds, and averaging those
+         * smears the rise: the number sat where a diseased upstroke sits because it was an
+         * artefact, not because the wearer's pulse was slow. 40 ms keeps the check on a foot
+         * landing absurdly close to the peak and stops it excluding healthy physiology. */
         /* Kept whether or not the gate lets them through, so a rejected shape can be told
          * apart from one that was never found. sut=0 with beats=7 says nothing about which. */
         shape_raw_sut = up;
         shape_raw_ai = a;
-        if (up > 80.0 && up < 300.0 && a > -0.2 && a < 1.5) {
+        if (up > 40.0 && up < 300.0 && a > -0.2 && a < 1.5) {
             *sut = up;
             *ai = a;
         }
@@ -2479,35 +2492,24 @@ int main(int argc, char **argv)
         usleep(200000);
     }
 
-    /* A ratio wants the vendor's fixed gain, not our search.
+    /* The gain used to be pinned to the vendor's 0x2828 here, and that was for the ratio.
      *
-     * Our loop walks 0x0118 until one channel is out of saturation and stops there, and where it
-     * stops is 0x4a09. At that gain the two channels sit at levels of 4,158 and 52,782 and the
-     * first carries one and a half counts of pulse - which is the faint red channel these notes
-     * have spent a day working around, and it is this loop that makes it faint. The LED is not
-     * faint; the wearer can see it.
+     * A ratio of ratios wants both channels lit evenly, so this held 0x0118 at the value the
+     * vendor ships and let the loop steer from there. It did what it was meant to: levels of
+     * 26,756 / 27,890 against our search's 4,158 / 52,782, and an R that looked physiological.
      *
-     * The vendor does not search. 0x0118 is 0x2828 in all three of their configurations and they
-     * regulate elsewhere. Measured against ours on one wrist:
+     * The saturation is gone and this outlived it. What it did not do was stay out of the way of
+     * everything else in this mode - a pressure reads the pulse shape, and the shape comes from
+     * one channel driven hard, which is the opposite of balanced. Held at 0x2828 the loop settles
+     * near 0x4040 and the wrist gives 74 to 95 counts of pulse; released, it settles near 0x6025
+     * and gives 137 to 146. On the weak signal the beats disagreed about the upstroke by ninety
+     * milliseconds, so averaging them flattened the ensemble's peak into a ramp and the
+     * augmentation index came out at -1.7 to -14. Released, all twenty-four beats agree to the
+     * sample and the index reads a steady 0.75.
      *
-     *     0x4a09, ours     levels  4,158 / 52,782   amplitudes  1.5 / 10.9
-     *     0x2828, theirs   levels 26,756 / 27,890   amplitudes 27.0 / 37.5
-     *     0x1d15           levels 12,632 / 20,512   amplitudes 27.9 / 51.9
-     *
-     * Balanced levels and a real pulse on both channels, which is what a ratio of ratios needs and
-     * what ours had not been giving. Three consecutive measurements at 0x2828 gave R of 0.874,
-     * 0.623 and 0.638, all physiological, where ours gives 1.7 to 2.1 on the same wrist.
-     *
-     * Only for the ratio. A rate reads one channel and is better off with that channel driven
-     * hard, which is what the search does well.
+     * That is why the pressure went quiet, and why bisecting the launcher never found it: every
+     * revision under test ran this same binary.
      */
-    if (want_spo2 && !getenv("NOFIXGAIN")) {
-        /* Start where the vendor sits, then let the loop above steer from there. */
-        gain = 0x2828;
-        wr16(0x0136, 0x0000);
-        wr16(0x0118, gain);
-        usleep(50000);
-    }
 
     /* An explicit gain, for putting ours beside the vendor's rather than arguing about it.
      *
@@ -2701,6 +2703,33 @@ int main(int argc, char **argv)
                  * survives with the gain held equal across passes then the gain was never the
                  * cause and it was standing in for something else.
                  */
+                /* The gain is an operating point, chosen once. After this it stops moving.
+                 *
+                 * Dropping the settling samples was not enough. The loop's hysteresis carries it
+                 * on past the band - "carry on up" below 42000, "carry on down" above 50000 - so
+                 * on a wrist that sits near an edge it keeps stepping for the whole pass, and each
+                 * step puts about 9500 counts of DC into both channels at once. Restarting the
+                 * analysis window on every change hides the transient but not the cadence: the
+                 * steps land at about one a second, and folding a pass at that period shows a
+                 * sawtooth of 1160 counts against a signal whose rms is 874.
+                 *
+                 * The peak detector then locks to the sawtooth rather than the pulse, and every
+                 * number downstream is measured on it. That is what the too-perfect readings were:
+                 * beat intervals of exactly 100 samples with no variability at all, every peak at
+                 * phase 98 of the 100-sample cycle, hr=60.0 with spread=0 and an upstroke of 50 ms
+                 * with a median absolute deviation of zero. A wearer's cuff read 52 to 54.
+                 *
+                 * Pinned after eight seconds, the same wrist gives 51 to 53 bpm against the cuff's
+                 * 52 to 54, an upstroke of 160 to 191 ms that varies from beat to beat as a real
+                 * one does, and 113/70 to 115/70 against a cuff mean of 117/67.
+                 *
+                 * Eight seconds because the part comes out of the start sequence clipped and the
+                 * loop has to walk down off the rail and back up to the band; six is enough on this
+                 * watch and eight leaves margin on a darker wrist, while still leaving the greater
+                 * part of a pass to measure in.
+                 */
+                if (!gain_locked && elapsed >= 8.0) gain_locked = 1;
+
                 if (gainfix && !gain_locked && elapsed > 6.0) {
                     newgain = gainfix;
                     gain_locked = 1;
@@ -3436,7 +3465,10 @@ int main(int argc, char **argv)
              * slower upstroke are expected rather than suspicious. A 258 ms upstroke with a
              * sound augmentation index was being thrown away, which is the gate deciding
              * physiology instead of detection. */
-            if (sut > 80 && sut < 300 && ai > 0.0 && ai < 1.5) {
+            /* The same 80 ms floor stood here as well, and had to come down for the same reason:
+             * a normal upstroke is 50 to 100 ms, so this was excluding healthy physiology rather
+             * than catching a bad detection. See the note on the gate in pulse_shape. */
+            if (sut > 40 && sut < 300 && ai > 0.0 && ai < 1.5) {
                 /* The intercepts now carry a cuff correction.
                  *
                  * Both were placeholders picked to land in a plausible range, which was all
