@@ -2102,6 +2102,27 @@ int main(int argc, char **argv)
         usleep(50000);
     }
 
+    /* An explicit gain, for putting ours beside the vendor's rather than arguing about it.
+     *
+     * Their working saturation run settles 0x0118 at 0x4f44 and walks it up from there, to 0x4f4c
+     * and then 0x564c. Ours starts in the same place they do - 0x9055, 0x2828, 0x9055 - and then
+     * walks down, once, to 0x2323, and stops. That is the only register the two configurations
+     * disagree on out of fifty-eight.
+     *
+     * Setting this pins the value; use it with FREEZEGAIN or the loop below will steer away from
+     * it. Both leave the part where they find it, and channel 2 rails at every value tried here
+     * and stays railed into the next run, so a run under this needs a plain one after it.
+     */
+    {
+        const char *ge = getenv("GAIN");
+        if (want_spo2 && ge) {
+            gain = (unsigned short)strtol(ge, 0, 0);
+            wr16(0x0136, 0x0000);
+            wr16(0x0118, gain);
+            usleep(50000);
+        }
+    }
+
     gettimeofday(&t0, 0);
     tprev = t0;
     for (;;) {

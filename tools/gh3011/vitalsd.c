@@ -1041,6 +1041,21 @@ static void measure(const char *mode, char *out, size_t outsz)
                 /* The median of the passes, not their pulse-weighted mean. See ring_add above. */
                 double med_r = 0, med_spread = 0;
                 int med_n = ring_view(&med_r, &med_spread);
+                /* Their curve is 110 - 25R exactly, and this one is not it.
+                 *
+                 * The vendor's saturation is a quadratic aR^2 + bR + c whose coefficients live in
+                 * the algorithm's config struct at offsets 0x2c, 0x30 and 0x34. The defaults are
+                 * written by the initialiser at 0x1f8c0 from three floats sitting together in the
+                 * binary: 0.0, -25.0 and 110.0. The square term is zero, so the curve is a line,
+                 * and the fit made here by measurement was right about the slope and six points
+                 * out on the intercept.
+                 *
+                 * The six points are not a calibration. They compensate for an R measured off a
+                 * pulse of six counts, where the vendor's own saturation mode will not accept an
+                 * amplitude below thirty-four. Correcting the intercept without correcting the
+                 * amplitude would move every reading down six points and fix nothing, so it stays
+                 * at 116 until the signal behind R is worth the vendor's constant.
+                 */
                 double abs_sat = 116.0 - 25.0 * (med_n >= 3 ? med_r : racc);
 
                 if (abs_sat >= 70.0 && abs_sat <= 100.0) {
