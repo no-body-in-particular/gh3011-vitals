@@ -47,6 +47,9 @@ Every measurement is appended to `/sdcard/vitals.log` with its full field set.
     tools/gh3011/adtwear.c     the chip's own wear detector
     tools/gh3011/ghcmd.c       sends the vendor daemon a command, for measuring ours against theirs
     tools/gh3011/regdump.c     reads the part's registers while it runs, echo-proof, changing nothing
+    tools/gh3011/fifograb.c    drains the FIFO without configuring anything, to read their settings
+    tools/gh3011/theirconfig.sh runs their daemon, kills it, and reads the stream it left behind
+    tools/gh3011/stream-ratio.py a second opinion on the ratio, narrowband, off a raw dump
     tools/gh3011/seq.h         the start sequence, generated from a capture of the vendor daemon
     tools/gh3011/adt_table.h   the auto-detect configuration, read out of the vendor binary
     docs/gh3011.md             the chip: registers, commands, and how a reading is taken
