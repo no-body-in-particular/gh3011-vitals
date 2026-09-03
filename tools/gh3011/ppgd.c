@@ -2612,14 +2612,34 @@ int main(int argc, char **argv)
              * reading a three-slot stream two at a time would look like. RAWDUMP writes the
              * samples out so the period can be measured instead of assumed.
              */
+            /* Paired the way the loop below pairs them, one frame a line, plus a burst marker.
+             *
+             * The flat one-sample-a-line format this used to write cannot be de-interleaved
+             * afterwards. Bursts are lvl*3 bytes and lvl varies, so a burst holding an odd number of
+             * samples flips the channel phase, and splitting the file by even and odd index
+             * scrambles the two channels from that point on. The loop below is immune because it
+             * pairs from each burst's own start; anything reading the file was not.
+             *
+             * That cost a whole capture: eight good passes, the pairing held throughout, and the
+             * offline analysis still could not reproduce this program's own ratio from its own
+             * samples - correlations of +0.27, -0.04, -0.22 and -0.19 across four formulations,
+             * against absolute values of 0.83 to 1.6 where the passes reported 0.40 to 0.51.
+             *
+             * So it writes "c1 c2" per frame now, which is exactly what the analysis needs and
+             * leaves nothing to infer. The burst line is kept as well, because a burst boundary is
+             * where a sample can go missing and an analysis measuring a rate should be able to see
+             * that rather than assume evenly spaced samples.
+             */
             if (getenv("RAWDUMP")) {
                 static FILE *rawf;
                 if (!rawf) rawf = fopen(getenv("RAWDUMP"), "w");
                 if (rawf) {
                     int q;
-                    for (q = 0; q + 2 < want; q += 3)
-                        fprintf(rawf, "%u\n",
-                                ((unsigned)buf[q]<<16)|(buf[q+1]<<8)|buf[q+2]);
+                    fprintf(rawf, "# burst %d\n", want / 6);
+                    for (q = 0; q + 5 < want; q += 6)
+                        fprintf(rawf, "%u %u\n",
+                                ((unsigned)buf[q]<<16)|(buf[q+1]<<8)|buf[q+2],
+                                ((unsigned)buf[q+3]<<16)|(buf[q+4]<<8)|buf[q+5]);
                     fflush(rawf);
                 }
             }
