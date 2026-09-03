@@ -94,7 +94,17 @@ static double dark_for(double dc)
     return units * DARK_UNIT;
 }
 
-/* Resting ratio-of-ratios for this sensor, measured with bin_amp on a still, healthy wrist.
+/* The ratio is still measured and still printed as r=, and it is NOT a saturation.
+ *
+ * Five tracking runs against a finger meter, the last with a genuine wavelength pair on the
+ * vendor's own scale, firm contact, a still wearer and a twelve point desaturation: R stayed inside
+ * 0.119 and wandered independently of the wearer's breathing. The vendor's own algorithm reported a
+ * flat 98 through the same test. docs/gh3011.md has the whole trail.
+ *
+ * It is kept because it is a real measurement of a real quantity and costs nothing to print, and
+ * because anyone who deletes it will re-derive it. It must not be turned back into a percentage.
+ *
+ * Resting ratio-of-ratios for this sensor, measured with bin_amp on a still, healthy wrist.
  * See the SpO2 comment below: this sets the offset of the whole scale, so it is the one number
  * to revisit if saturation ever reads implausibly. */
 #define R_REST 0.35
@@ -131,68 +141,6 @@ static double dark_for(double dc)
 #define LED_DRIVE_SPO2 0x0110
 
 
-/* The vendor's saturation curve for this watch, and what our ratio has to be divided by to use it.
- *
- * The curve is not fitted here. It is the host parameter block their daemon hands the library -
- * ids 0x2030 to 0x2035, three 32-bit values at a scale of ten thousand - overriding coefficients
- * whose defaults, 0.0, -25.0 and 110.0, are three floats in their binary.
- *
- * The divisor is measured, and measured twice. Their daemon and ours were run on the same wrist
- * minutes apart, theirs driven into saturation mode by hand because nothing on this watch has ever
- * asked it for one:
- *
- *     theirs 98%  -> their R 0.4959   ours 1.0490 (three runs)   ratio 2.115
- *     theirs 97%  -> their R 0.5275   ours 0.9907 (three runs)   ratio 1.878
- *
- * Two is within both. Through their curve at half, our ratios give 97.1% where they said 98 and
- * 98.0% where they said 97 - a point out either way, in opposite directions, which is the twelve
- * percent between the two ratios showing up as two points of saturation.
- *
- * So this is worth about a point, on two comparisons a single percent of saturation apart. That is
- * enough to log and watch and nowhere near enough to publish.
- *
- * AND THEN THE RATIO IT WAS FITTED TO TURNED OUT TO BE WRONG. Both comparisons above were taken
- * while the gain loop was hunting - see the deadband note further down - and a gain change puts a
- * DC step of some 9,500 counts into both channels at once, two orders above the pulse and common to
- * the pair, which drives the amplitude ratio towards one. That is why R sat so convincingly near
- * 1.000 and why it was so repeatable: it was measuring the gain loop, not the blood.
- *
- * With the gain held still, on the same wrist within the hour, R reads 1.78 to 1.94 across six
- * passes with ac1/ac2 near 1.85. Against their 0.496 that is a divisor near 3.6, not 2.0.
- *
- * The divisor below is therefore stale and spo2v computed from it is not to be believed. It is left
- * at 2.0 rather than quietly moved to 3.6, because 3.6 would be fitted to their reading taken
- * through the same broken loop, and replacing one number derived from contaminated data with
- * another is not progress. The paired comparison has to be run again against a settled gain.
- *
- * This file has published a confident 86% before, off a ratio that turned out to be two counts
- * divided by itself. This is the second time a ratio here has been steady, plausible, repeatable
- * and an artefact of the code measuring it.
- */
-#define VENDOR_SPO2_A   (-1.0223)
-#define VENDOR_SPO2_B   (-30.5835)
-#define VENDOR_SPO2_C   (113.4171)
-/* One, now that the pairing is configured.
- *
- * This was 2.0, fitted against their daemon while 0x0136 was zero and our ratio was pinned near 1,
- * and it was argued up to 3.6 at one point. Both numbers were compensating for the register. With
- * the pairing active our ratio is theirs: 0.469 to 0.594 measured here against their 0.496 for the
- * 98 percent a finger meter agrees with, so their curve applies directly and the divisor is one.
- *
- * Kept as a named constant rather than deleted because the whole history of this file argues it
- * will need looking at again.
- */
-#define VENDOR_R_DIVISOR 1.0
-
-static double vendor_spo2(double r_ours)
-{
-    double r = r_ours / VENDOR_R_DIVISOR;
-    double s;
-    if (!(r > 0.0)) return 0.0;
-    s = VENDOR_SPO2_A * r * r + VENDOR_SPO2_B * r + VENDOR_SPO2_C;
-    if (s > 100.0) s = 100.0;
-    return s < 50.0 ? 0.0 : s;
-}
 
 static int fd = -1;
 static void on_alarm(int s) { (void)s; }        /* no SA_RESTART: unblocks a stuck wait */
@@ -3465,7 +3413,7 @@ int main(int argc, char **argv)
              * Reported only when both channels are genuinely pulsatile. In green mode the second
              * channel is not infrared at all and R lands between 1.5 and 3.5, meaning nothing.
              */
-            double spo2 = 0, sut = 0, ai = 0, sbp = 0, dbp = 0;
+            double sut = 0, ai = 0, sbp = 0, dbp = 0;
             double mot_med = -1, mot_worst = -1;
             motion_summary(&mot_med, &mot_worst);
             narrow_ratio(ns, fs, med);
@@ -3482,7 +3430,7 @@ int main(int argc, char **argv)
              * than a six point desaturation does. Both channels have to clear it, and when they do
              * not the field stays zero and the reader falls through as it always did.
              */
-            if (a1 >= 34.0 && a2 >= 34.0) spo2 = vendor_spo2(r);
+
 
             /* No percentage. R is printed because it is a real measurement and worth watching;
              * turning it into a saturation is what there is no basis for.
@@ -3552,11 +3500,11 @@ int main(int argc, char **argv)
             }
 
             printf("hr=%.0f spread=%.0f hz=%.1f samples=%d windows=%d gain=%04x"
-                   " dc1=%.0f dc2=%.0f ac1=%.0f ac2=%.0f r=%.3f spo2=%.0f beats=%d raw=%.0f/%.2f sut=%.0f ai=%.2f motion=%.0f/%.0f"
+                   " dc1=%.0f dc2=%.0f ac1=%.0f ac2=%.0f r=%.3f beats=%d raw=%.0f/%.2f sut=%.0f ai=%.2f motion=%.0f/%.0f"
                    " conf=%.2f peaks=%d sutmed=%.0f sutmad=%.0f sutn=%d sbp=%.0f dbp=%.0f mcomp=%.3f/%.3f"
                    " gsmean=%.0f gssd=%.0f gsmin=%.0f gsmax=%.0f gsrange=%.0f"
                    " nb1=%.1f nb2=%.1f rband=%.3f used=%s%s\n",
-                   med, spread, fs, ns, nrates, gain, dc1, dc2, a1, a2, r, spo2, shape_beats, shape_raw_sut, shape_raw_ai, sut, ai, mot_med, mot_worst,
+                   med, spread, fs, ns, nrates, gain, dc1, dc2, a1, a2, r, shape_beats, shape_raw_sut, shape_raw_ai, sut, ai, mot_med, mot_worst,
                    /* Within two bpm, which is about what the reference itself holds to: the cuff
                     * moved between 58 and 61 across four minutes on a resting wearer, so a
                     * tighter tolerance would claim more than anything here can check. */
