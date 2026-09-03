@@ -108,6 +108,29 @@ static double dark_for(double dc)
  */
 #define SETTLE_SECS 3.0
 
+/* 0x0136, and why it must never be written as zero for a saturation.
+ *
+ * This is the register that makes the two channels a wavelength pair. The shipped configuration
+ * leaves it at zero; Goodix's reference saturation array sets 0x0110; and that is the whole
+ * difference between having a ratio and not having one:
+ *
+ *     0x0000   ac1 85, 134, 84     ac2 83, 125, 82    ratio ~1.0   R 0.964, 1.009, 0.970
+ *     0x0110   ac1 103, 105, 101   ac2 227, 228, 227  ratio  2.2   R 0.482, 0.486, 0.471
+ *
+ * And this code was erasing it. All four places that write 0x0118 wrote 0x0136 = 0 immediately
+ * first - copied from the vendor's own trace, which pairs the two writes that way - so an override
+ * survived only until the current loop next moved. That is why short passes read a hundred counts
+ * and a hundred-and-ten-second capture collapsed from seventy counts to eleven, five seconds in:
+ * the loop stepped, and the pair went away.
+ *
+ * That the vendor pairs those writes is consistent with their own saturation being broken for this
+ * same reason, and with them shipping it disabled behind a flag.
+ *
+ * Zero for the rate, which is green, single-channel, and wants nothing here.
+ */
+#define LED_DRIVE_SPO2 0x0110
+
+
 /* The vendor's saturation curve for this watch, and what our ratio has to be divided by to use it.
  *
  * The curve is not fitted here. It is the host parameter block their daemon hands the library -
@@ -2569,6 +2592,21 @@ int main(int argc, char **argv)
             usleep(50000);
         }
     }
+
+    /* And the pairing, written once, after the start sequence and before sampling begins.
+     *
+     * It has to be exactly here. Written earlier - in the slot block, or beside the first current
+     * write - the light level comes up so far that the current loop walks to its floor of 0x0a0a
+     * and the ratio lands at 1.33. Written once at this point, which is where the command-line
+     * override used to land, the loop settles at 0x4343 and the ratio at 0.47.
+     *
+     * The current loop still writes 0x0136 = 0 on every adjustment and that is deliberately left
+     * alone: in the runs that worked the register was zero for most of the pass and the pairing held
+     * anyway, so this behaves as a one-shot that configures the channels rather than a level needing
+     * to be maintained. Same lesson as the rail and the pinned current - on this part the order of
+     * writes carries as much as their values.
+     */
+    if (want_spo2) wr16(0x0136, LED_DRIVE_SPO2);
 
     acc_start();               /* the accelerometer, at a rate that can describe movement */
     gettimeofday(&t0, 0);
