@@ -23,6 +23,7 @@
 #include <unistd.h>
 #include <signal.h>
 #include <sys/ioctl.h>
+#include <pthread.h>
 #include <sys/time.h>
 
 #define PWR  0x40044702u    /* GH_IOC_ENABLE_POWER, immediate 1/0 - not a pointer */
@@ -168,6 +169,70 @@ static double asum_x, asum_y, asum_z, asum_mag, asum_magsq;
 static double amag_lo = 1e18, amag_hi = -1e18;
 static long asamples;
 
+/* A sampler thread, because one read per optical burst can never describe movement.
+ *
+ * The part is not slow. Polled flat out it returns a new value about 105 times a second, which is
+ * the optical rate - so everything needed to describe an arm swinging is already being produced and
+ * was simply not being collected. What reached the analysis was eleven samples in twenty-one
+ * seconds, because the gh3011 driver's own accelerometer ioctl hands back a buffer it never filled
+ * and the fallback reads the part once per optical burst, on every other burst. Half a hertz. The
+ * motion masking in the rate estimator needs more than sixty-four samples before it will even
+ * compute a sample rate, so at half a hertz it has never once run.
+ *
+ * Reading it more often from inside the sampling loop is what the fallback's comment rules out: an
+ * i2c transfer there costs the loop its timing and turns working measurements into no_cluster. A
+ * thread does not sit inside the loop. The two devices share bus 2, but they are reached through
+ * different file descriptors and the kernel serialises transactions on the bus, so this cannot
+ * corrupt an optical read - it can only delay one, by the 300 microseconds a transfer takes, a
+ * hundred times a second. Three percent of the bus.
+ *
+ * The thread owns the accelerometer for the length of a measurement: note_motion stops touching the
+ * part while it runs and takes its per-burst figure from what the thread has collected since the
+ * last burst, which is a range over a hundred samples rather than one reading.
+ */
+#define ACC_HZ 100
+static volatile int acc_stop;
+static pthread_t acc_tid;
+static int acc_live;
+static int acc_burst_at;
+
+static int da217_read(short *x, short *y, short *z);
+
+static void *acc_sampler(void *unused)
+{
+    (void) unused;
+    while (!acc_stop) {
+        short ax, ay, az;
+        if (da217_read(&ax, &ay, &az)) {
+            double x = ax, y = ay, z = az;
+            double m = sqrt(x * x + y * y + z * z);
+            if (naccel < MAXACC) accel_mag[naccel++] = m;
+            asum_x += x; asum_y += y; asum_z += z;
+            asum_mag += m; asum_magsq += m * m;
+            if (m < amag_lo) amag_lo = m;
+            if (m > amag_hi) amag_hi = m;
+            asamples++;
+        }
+        usleep(1000000 / ACC_HZ);
+    }
+    return NULL;
+}
+
+static void acc_start(void)
+{
+    if (acc_live || getenv("NOACCTHREAD")) return;
+    acc_stop = 0;
+    if (pthread_create(&acc_tid, NULL, acc_sampler, NULL) == 0) acc_live = 1;
+}
+
+static void acc_finish(void)
+{
+    if (!acc_live) return;
+    acc_stop = 1;
+    pthread_join(acc_tid, NULL);
+    acc_live = 0;
+}
+
 /* The accelerometer off the bus, when the driver's buffer is empty.
  *
  * The ACCEL ioctl reads a buffer the gh3011 driver keeps, and on this watch it returns nothing:
@@ -245,6 +310,20 @@ static void note_motion(void)
             if (q[0] || q[1] || q[2] || q[3] || q[4] || q[5]) allzero = 0;
         }
         if (allzero) n = 0;
+    }
+
+    if ((n <= 0 || n > 100) && acc_live) {
+        /* The thread has the part. Take the burst figure from what it collected since the last
+         * one, which is a range over about a hundred samples rather than a single reading. */
+        int cur = naccel, k;
+        double blo = 1e18, bhi = -1e18;
+        for (k = acc_burst_at; k < cur; k++) {
+            if (accel_mag[k] < blo) blo = accel_mag[k];
+            if (accel_mag[k] > bhi) bhi = accel_mag[k];
+        }
+        burst_motion[nmotion++] = (cur > acc_burst_at + 1 && bhi >= blo) ? bhi - blo : -1.0;
+        acc_burst_at = cur;
+        return;
     }
 
     if (n <= 0 || n > 100) {
@@ -960,6 +1039,103 @@ static double spectral_bpm_d(const double *d, int n, double fs, double *conf)
  * The rest follows them too: a ratio per beat rather than one for the record, then the median.
  * One beat where the arm twitched moves a mean and cannot move a median.
  */
+/* Take the movement out of both channels before the ratio is measured.
+ *
+ * Until now movement was only ever a veto here: too little amplitude, or windows that disagree, and
+ * the pass is thrown away whole. The vendor does not throw it away - spo2_r_value comes out of a
+ * call whose first arguments are the accelerometer FIFO, forty samples a second by their own log -
+ * so the arm's movement is an input to their ratio and was not an input to ours.
+ *
+ * What is removed is the part of each channel that is linearly predictable from the accelerometer:
+ * the magnitude, and its derivative, which between them cover a displacement and the velocity that
+ * goes with it. Two regressors, least squares, closed form. Both are mean-removed before the fit
+ * and only they are subtracted, so the DC level each channel sits on is untouched - which matters,
+ * because the ratio divides by that level and it carries the zero-light pedestal.
+ *
+ * The same correction is applied to both channels with their own coefficients. It has to be the
+ * same operation or the ratio stops meaning anything: R is (ac1/l1)/(ac2/l2) and cleaning one
+ * channel harder than the other moves it directly.
+ *
+ * Two properties worth checking against, both cheap: on a still wrist the reference is nearly
+ * constant, so the fit removes nearly nothing and the ratio should not move; and the fraction
+ * removed is reported as mcomp= so a pass that has been heavily rewritten cannot be mistaken for a
+ * clean one. If more than half a channel's variance is movement the pass is left alone, because at
+ * that point what remains is not a pulse with noise on it.
+ */
+static double mcomp_frac1, mcomp_frac2;
+
+static void motion_clean(unsigned int *a, unsigned int *b, int n)
+{
+    static double mo[MAXS], u1[MAXS], u2[MAXS];
+    double s11 = 0, s12 = 0, s22 = 0, det;
+    double m1 = 0, m2 = 0;
+    int i;
+
+    mcomp_frac1 = mcomp_frac2 = 0.0;
+    if (n < 256 || naccel < 64 || n > MAXS) return;
+
+    /* The accelerometer onto the optical grid. The two run at their own rates and are mapped by
+     * position through the measurement, which is what the rest of this file already does with
+     * them; linear between samples rather than nearest, because a step in the reference would put
+     * a step into everything it is subtracted from. */
+    for (i = 0; i < n; i++) {
+        double t = (double)i * (double)(naccel - 1) / (double)(n - 1);
+        int k = (int)t;
+        double f = t - k;
+        if (k >= naccel - 1) { k = naccel - 2; f = 1.0; }
+        mo[i] = accel_mag[k] * (1.0 - f) + accel_mag[k + 1] * f;
+    }
+
+    for (i = 0; i < n; i++) m1 += mo[i];
+    m1 /= n;
+    for (i = 0; i < n; i++) u1[i] = mo[i] - m1;
+    u2[0] = 0.0;
+    for (i = 1; i < n; i++) u2[i] = mo[i] - mo[i - 1];
+    for (i = 0; i < n; i++) m2 += u2[i];
+    m2 /= n;
+    for (i = 0; i < n; i++) u2[i] -= m2;
+
+    for (i = 0; i < n; i++) { s11 += u1[i] * u1[i]; s12 += u1[i] * u2[i]; s22 += u2[i] * u2[i]; }
+    det = s11 * s22 - s12 * s12;
+    if (!(det > 0.0) || s11 <= 0.0 || s22 <= 0.0) return;
+
+    {
+        unsigned int *ch[2];
+        double *frac[2];
+        int c;
+        ch[0] = a; ch[1] = b;
+        frac[0] = &mcomp_frac1; frac[1] = &mcomp_frac2;
+
+        for (c = 0; c < 2; c++) {
+            double mean = 0, b1 = 0, b2 = 0, c1, c2, before = 0, after = 0;
+            for (i = 0; i < n; i++) mean += ch[c][i];
+            mean /= n;
+            for (i = 0; i < n; i++) {
+                double x = (double)ch[c][i] - mean;
+                b1 += x * u1[i];
+                b2 += x * u2[i];
+                before += x * x;
+            }
+            c1 = (b1 * s22 - b2 * s12) / det;
+            c2 = (b2 * s11 - b1 * s12) / det;
+
+            for (i = 0; i < n; i++) {
+                double x = (double)ch[c][i] - mean - (c1 * u1[i] + c2 * u2[i]);
+                after += x * x;
+            }
+            if (!(before > 0.0)) continue;
+            *frac[c] = 1.0 - after / before;
+            if (*frac[c] > 0.5 || *frac[c] < 0.0) { *frac[c] = -*frac[c]; continue; }
+
+            for (i = 0; i < n; i++) {
+                double v = (double)ch[c][i] - (c1 * u1[i] + c2 * u2[i]);
+                if (v < 0.0) v = 0.0;
+                ch[c][i] = (unsigned int)(v + 0.5);
+            }
+        }
+    }
+}
+
 static int beatwise_ratio(const double *ppg, const unsigned int *a, const unsigned int *b,
                           int n, double fs, double bpm, double *out_r, int *out_beats)
 {
@@ -2146,6 +2322,7 @@ int main(int argc, char **argv)
         }
     }
 
+    acc_start();               /* the accelerometer, at a rate that can describe movement */
     gettimeofday(&t0, 0);
     tprev = t0;
     for (;;) {
@@ -2474,7 +2651,13 @@ int main(int argc, char **argv)
     }
     gettimeofday(&t1, 0);
     elapsed = (t1.tv_sec-t0.tv_sec) + (t1.tv_usec-t0.tv_usec)/1e6;
+    acc_finish();              /* sole writer of accel_mag; joined before anything reads it */
     stop_chip();
+
+    /* MOTIONCOMP=1 until it has been shown to leave a still wrist alone and to help a moving one.
+     * It cleans the arrays the rate is read from as well as the ratio, which is more than the
+     * saturation asked for, so it is one switch and not on by default. */
+    if (getenv("MOTIONCOMP")) motion_clean(ch1, ch2, ns);
 
     if ((ns < 600 && !want_ratio) || ns < 200 || elapsed <= 0) {
         printf("hr=0 reason=too_few_samples samples=%d rounds=%d timeouts=%d\n",
@@ -2948,7 +3131,7 @@ int main(int argc, char **argv)
 
             printf("hr=%.0f spread=%.0f hz=%.1f samples=%d windows=%d gain=%04x"
                    " dc1=%.0f dc2=%.0f ac1=%.0f ac2=%.0f r=%.3f spo2=%.0f beats=%d raw=%.0f/%.2f sut=%.0f ai=%.2f motion=%.0f/%.0f"
-                   " conf=%.2f peaks=%d sutmed=%.0f sutmad=%.0f sutn=%d sbp=%.0f dbp=%.0f used=%s%s\n",
+                   " conf=%.2f peaks=%d sutmed=%.0f sutmad=%.0f sutn=%d sbp=%.0f dbp=%.0f mcomp=%.3f/%.3f used=%s%s\n",
                    med, spread, fs, ns, nrates, gain, dc1, dc2, a1, a2, r, spo2, shape_beats, shape_raw_sut, shape_raw_ai, sut, ai, mot_med, mot_worst,
                    /* Within two bpm, which is about what the reference itself holds to: the cuff
                     * moved between 58 and 61 across four minutes on a resting wearer, so a
@@ -2959,6 +3142,7 @@ int main(int argc, char **argv)
                     * says how much to believe it. */
                    confidence_p(rates, nrates, 2.0), shape_peaks,
                    shape_sut_med, shape_sut_mad, shape_sut_n, sbp, dbp,
+                   mcomp_frac1, mcomp_frac2,
                    src == ch2 ? "ch2" : "ch1",
                    /* Say so when the windows did not agree on their own and the previous rate
                     * chose between them. Worth having under motion, and not the same claim as a
