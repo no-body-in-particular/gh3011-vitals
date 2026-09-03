@@ -45,11 +45,7 @@ Every measurement is appended to `/sdcard/vitals.log` with its full field set.
     tools/gh3011/vitalsd.c     the daemon: socket, wear check, two-pass measurement
     tools/gh3011/ppgd.c        the measurement itself, and everything that reads a waveform
     tools/gh3011/adtwear.c     the chip's own wear detector
-    tools/gh3011/ghcmd.c       sends the vendor daemon a command, for measuring ours against theirs
-    tools/gh3011/regdump.c     reads the part's registers while it runs, echo-proof, changing nothing
-    tools/gh3011/fifograb.c    drains the FIFO without configuring anything, to read their settings
-    tools/gh3011/theirconfig.sh runs their daemon, kills it, and reads the stream it left behind
-    tools/gh3011/stream-ratio.py a second opinion on the ratio, narrowband, off a raw dump
+    tools/gh3011/ratio-lab.py  tries different ratio formulations against a captured pass, offline
     tools/gh3011/seq.h         the start sequence, generated from a capture of the vendor daemon
     tools/gh3011/adt_table.h   the auto-detect configuration, read out of the vendor binary
     docs/gh3011.md             the chip: registers, commands, and how a reading is taken
@@ -61,11 +57,18 @@ An Android NDK arm32 toolchain, and nothing else:
     armv7a-linux-androideabi19-clang -Os -Wall -o ppgd ppgd.c -lm
     armv7a-linux-androideabi19-clang -Os -Wall -o vitalsd vitalsd.c
     armv7a-linux-androideabi19-clang -Os -Wall -o adtwear adtwear.c
-    armv7a-linux-androideabi19-clang -Os -Wall -o ghcmd ghcmd.c
-    armv7a-linux-androideabi19-clang -Os -Wall -o regdump regdump.c
 
 `tools/gh3011/install-vitalsd.sh` puts them on the watch and takes over the init slot. It keeps
 the vendor daemon at `gh3011_service.real` so the swap is one `cat` in either direction.
+
+## The captures
+
+`docs/data/` holds the saturation measurements and nothing else: five breath-hold runs against a
+finger meter, the vendor daemon's own output through a desaturation, a capture of their configured
+stream, and under `hold-raw/` eight passes of paired raw samples spanning a hold from 99 to 91.
+
+They are kept because they are what any future attempt at a saturation has to beat, and because
+producing them cost a wearer a lot of breath-holding. `tools/gh3011/ratio-lab.py` reads them.
 
 ## What is not here
 
