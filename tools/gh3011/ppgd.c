@@ -132,6 +132,10 @@ static double dark_for(double dc)
  */
 #define AGC_TARGET 26000.0
 
+/* Counts of pulse a channel must carry before its shape is worth measuring. Measured over one
+ * night: below this the per-pass upstroke median scatters twice as much as above it. */
+#define SHAPE_MIN_AMP 15.0
+
 /* The code that would put this channel on the target, from the code it is on now and the level
  * that produced. Clamped to a dozen codes a move so one bad reading cannot fling the LED to an
  * extreme, and left alone inside a deadband because every change costs the analysis window. */
@@ -3618,7 +3622,27 @@ int main(int argc, char **argv)
             /* The same 80 ms floor stood here as well, and had to come down for the same reason:
              * a normal upstroke is 50 to 100 ms, so this was excluding healthy physiology rather
              * than catching a bad detection. See the note on the gate in pulse_shape. */
-            if (sut > 40 && sut < 300 && ai > 0.0 && ai < 1.5) {
+            /* And only when there was a pulse to measure the shape on.
+             *
+             * Nothing here checked the amplitude, so a pass with no pulse still produced a
+             * shape and a pressure from it. Over a night of twenty-two passes the amplitude
+             * ranged from 0.8 counts to 83 - contact and perfusion move that much on a sleeping
+             * wrist - and three of them published a pressure off two to four counts:
+             *
+             *     ac1=3 sutn=6   ->  107/66
+             *     ac1=2 sutn=6   ->  108/66
+             *     ac1=4 sutn=10  ->  108/67
+             *
+             * Those are arithmetic on noise, and they look exactly like the good ones, which is
+             * worse than not reporting. The same night says where the line goes: below fifteen
+             * counts the beats disagree about the upstroke half again as much as above it, the
+             * spread of the per-pass median going from 6.7% to 12.3%.
+             *
+             * This is the same fault as a rate of 60 off a wrist the sensor was not touching.
+             * An instrument that answers when it has nothing to answer from is the failure this
+             * project exists to replace. */
+            if ((a1 >= SHAPE_MIN_AMP || a2 >= SHAPE_MIN_AMP) &&
+                sut > 40 && sut < 300 && ai > 0.0 && ai < 1.5) {
                 /* The intercepts now carry a cuff correction.
                  *
                  * Both were placeholders picked to land in a plausible range, which was all
