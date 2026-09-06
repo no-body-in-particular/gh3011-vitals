@@ -118,6 +118,33 @@ static double dark_for(double dc)
  */
 #define SETTLE_SECS 3.0
 
+/* PAIR=<hex>: writes 0x0136 and stops the gain loop erasing it. It changes nothing.
+ *
+ * 0x0136 is recorded in the notes as the LED drive - low byte channel 1, high byte channel 2,
+ * linear and independent, sweeping from 64,867 counts at 0x08 to 1,899,082 at 0x7f - and as the
+ * switch that makes the two channels a wavelength pair. If that were so it would be the missing
+ * piece for a ratio of ratios: the saturation work could never light both channels at once
+ * because one register drove them together, and this would separate them.
+ *
+ * It does not. Measured with the loop allowed to unclip the part and then pinned at one gain, so
+ * that nothing compensates for the light:
+ *
+ *     PAIR=0x0000   dc1 3170915   level 25,187
+ *     PAIR=0x7f7f   dc1 3170916   level 25,188
+ *
+ * One count apart at the two ends of the range, where the notes predict a factor of thirty. The
+ * amplitudes move between passes - 33/84, 26/42, 14/18 - but not with PAIR, and not in order;
+ * that is contact drifting on a wrist while four passes run.
+ *
+ * The table in the notes was taken with the current loop frozen, and freezing it from the first
+ * sample is exactly what holds channel 2 against its rail - the same trap this file documents
+ * elsewhere. What it measured was a clipped part responding to nothing, not an LED drive.
+ *
+ * Left in, default off and inert, because the negative result is worth keeping: the one mechanism
+ * that could have reopened the saturation question has been tried and does not exist on this part.
+ */
+static unsigned short pair_drive = 0;
+
 /* The level the gain loop aims for, in counts above the dark pedestal.
  *
  * Measured rather than chosen. The 1 Hz component that rides on the burst cadence grows far
@@ -2104,6 +2131,7 @@ int main(int argc, char **argv)
     const char *mode = argc > 3 ? argv[3] : "";
     { const char *pb = getenv("PREV_BPM"); if (pb) prev_bpm = atof(pb); }
     { const char *gf = getenv("GAINFIX"); if (gf) gainfix = (unsigned short)strtol(gf, 0, 0); }
+    { const char *pd = getenv("PAIR"); if (pd) pair_drive = (unsigned short)strtol(pd, 0, 0); }
     int want_ratio = (strcmp(mode, "ratio") == 0);
     int want_redo  = (strcmp(mode, "redo") == 0);
     /*
@@ -2564,7 +2592,7 @@ int main(int argc, char **argv)
             wr16(0x0132, 0x0446);
             wr16(0x0134, 0x0546);
             wr16(0x0186, 0x0406);
-            wr16(0x0136, 0x0000);
+            wr16(0x0136, pair_drive);
             wr16(0x0080, 0x0605);
             wr16(0x0082, 0x01c6);
             wr16(0x0084, 0x0023);
@@ -2653,7 +2681,7 @@ int main(int argc, char **argv)
         const char *ge = getenv("GAIN");
         if (want_spo2 && ge) {
             gain = (unsigned short)strtol(ge, 0, 0);
-            wr16(0x0136, 0x0000);
+            if (!pair_drive) wr16(0x0136, 0x0000);
             wr16(0x0118, gain);
             usleep(50000);
         }
@@ -3132,7 +3160,8 @@ int main(int argc, char **argv)
                     settled_at = ns;
                     gain_changes++;
                     gain = newgain;
-                    wr16(0x0136, 0x0000);
+                    /* Only when nothing was asked for: writing zero here is what erased it. */
+                    if (!pair_drive) wr16(0x0136, 0x0000);
                     wr16(0x0118, gain);
                 }
             }
