@@ -144,7 +144,15 @@ static int solve_code(int code, double lvl)
     double want;
     int step;
     if (lvl > 62000.0) return code - 8;            /* railed: the level says nothing */
-    if (code <= 0 || lvl < 500.0) return code + 4; /* too dark to reason from: open up */
+    /* Nothing coming back at all is not a gain problem, and treating it as one burns the LED.
+     *
+     * Off the wrist the level sits at the bare pedestal - about 88 counts against a rail of
+     * 64,900 - which fell under this floor, so the loop read it as "too dark" and opened up by
+     * four codes a go until the current pinned at maximum, then held it there. A watch sitting
+     * on a table drove its LED flat out. No amount of current conjures a wrist, so leave the
+     * gain where it is and let the amplitude gates upstream refuse the measurement. */
+    if (lvl < 500.0) return code;
+    if (code <= 0) return GAIN_CODE_MIN;
     if (lvl > AGC_TARGET * 0.85 && lvl < AGC_TARGET * 1.18) return code;
     want = AGC_TARGET * (double)code / lvl;
     step = (int)(want + 0.5) - code;
